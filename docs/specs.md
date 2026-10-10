@@ -148,13 +148,23 @@ wallet for it in the keys app, and an account stays unlocked only on terms a per
   person pick, create or restore one, with optional `unlock` terms and a `reason`. A network must
   belong to the wallet's chain (`main` or `test`); a request naming the wrong one is refused before
   anything is shown. It answers `{ ok, handle, receipt, state }`. Once the custodian approves,
-  `fetch_result` with the receipt returns `{ group, family, chain, network, external, internal,
-  fingerprint, databaseKey, unlocked }`, `network` being the one the request named, and the
-  wallet is **open** for that module: `account_descriptors` (`{ group }` → `{ ok, group, external,
-  internal }`) answers it again, and nobody else. `close_account` (`{ group }`) ends that; an unlock
-  scoped to the module alone ends with it.
+  `fetch_result` with the receipt returns `{ ok, result: { group, family, chain, network, external,
+  internal, fingerprint, databaseKey, origin, birthday, unlocked } }`, `network` being the one the
+  request named, and the wallet is **open** for that module: `account_descriptors(group)`, the
+  wallet's id as a plain string, answers `{ ok, group, external, internal }` to it again, and to
+  nobody else. `close_account` (`{ group }`) ends that; an unlock scoped to the module alone ends
+  with it.
+- **Where a wallet's history starts.** `origin` is `created` when the keys app made the wallet's
+  phrase for it, and `birthday` is then the day it was made: no coin can have reached it before.
+  Otherwise it is `restored`, with the day the person gave as `birthday`, or `null`. A wallet core
+  starts scanning at the birthday, or, for a restored wallet without one, where its family began:
+  segwit's activation for `bitcoin`, taproot's for `bitcoin_taproot`. Both come from the keystore's
+  record, so a wallet made before it kept them reads `restored`, with no birthday.
 - `request_unlock` takes `{ account, ttlMs?, count?, apps?, confirm?, reason? }`, the terms an app
-  asks for. `fetch_result` returns the terms the person granted, which may differ.
+  asks for. `fetch_result` returns `{ ok, result: { account, terms, expiresInMs, countLeft } }`:
+  the terms the person granted, which may differ.
+- A requester has at most two open or unlock requests pending, and one nobody shows within five
+  minutes settles `expired_no_ack`.
 - The custodian (the keys app) works the queue with `access_requests`, `acknowledge_access` (the
   lines to show, the commitment to echo, and `asked`: the wallet or the family and network to pick
   from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?,

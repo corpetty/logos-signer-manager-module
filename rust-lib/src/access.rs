@@ -26,9 +26,18 @@ pub const MAX_PENDING_PER_REQUESTER: usize = 2;
 pub const SETTLED_RETENTION: Duration = Duration::from_secs(120);
 pub const ABANDONED_OFFER_TTL: Duration = Duration::from_secs(300);
 
+/// What the keystore hands over when a wallet opens: its database key, and where its history can start.
+pub struct OpenedWallet {
+    pub database_key: Zeroizing<String>,
+    /// `created` or `restored`.
+    pub origin: String,
+    /// The wallet's first possible day, `YYYY-MM-DD`, when known.
+    pub birthday: Option<String>,
+}
+
 /// What the keystore does for an open or an unlock, beyond the signer interface.
 pub trait KeyHolder {
-    fn database_key(&mut self, group: &str, password: Option<&str>) -> Result<Zeroizing<String>>;
+    fn database_key(&mut self, group: &str, password: Option<&str>) -> Result<OpenedWallet>;
     fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> Result<Unlocked>;
     fn lock(&mut self, account: Option<&str>) -> Result<usize>;
     fn unlocked(&mut self) -> Result<Vec<Unlocked>>;
@@ -444,7 +453,7 @@ impl Access {
                     acct.chain.network(n)?;
                 }
                 let terms = decision.unlock.or_else(|| p.unlock.clone());
-                let database_key = keys.database_key(&group, Some(&password))?;
+                let opened = keys.database_key(&group, Some(&password))?;
                 let scope = match &terms {
                     Some(t) => {
                         t.check()?;
@@ -456,8 +465,8 @@ impl Access {
                 let result = serde_json::json!({
                     "group": group, "family": found.account.family, "chain": acct.chain.as_str(), "network": p.network,
                     "external": acct.descriptor(0), "internal": acct.descriptor(1),
-                    "fingerprint": acct.fingerprint.to_string(), "databaseKey": database_key.as_str(),
-                    "unlocked": terms,
+                    "fingerprint": acct.fingerprint.to_string(), "databaseKey": opened.database_key.as_str(),
+                    "origin": opened.origin, "birthday": opened.birthday, "unlocked": terms,
                 });
                 self.grants.retain(|(m, g)| !(m == &requester && g == &group));
                 self.grants.push((requester.clone(), group));
@@ -620,9 +629,13 @@ pub(crate) mod tests {
     }
 
     impl KeyHolder for FakeKeys {
-        fn database_key(&mut self, _: &str, password: Option<&str>) -> Result<Zeroizing<String>> {
+        fn database_key(&mut self, _: &str, password: Option<&str>) -> Result<OpenedWallet> {
             match password {
-                Some("pw") => Ok(Zeroizing::new("ab".repeat(32))),
+                Some("pw") => Ok(OpenedWallet {
+                    database_key: Zeroizing::new("ab".repeat(32)),
+                    origin: "restored".into(),
+                    birthday: Some("2021-11-14".into()),
+                }),
                 _ => Err(ManagerError::Signer(logos_signer_interface::SignerError::new(
                     logos_signer_interface::ErrorCode::WrongSecret,
                     "the password for this account is not correct",
@@ -691,6 +704,7 @@ pub(crate) mod tests {
         assert_eq!(got["group"], "mock-segwit");
         assert_eq!((got["chain"].as_str(), got["network"].as_str()), (Some("test"), Some("signet")));
         assert_eq!(got["databaseKey"], "ab".repeat(32));
+        assert_eq!((got["origin"].as_str(), got["birthday"].as_str()), (Some("restored"), Some("2021-11-14")));
         assert!(got["external"].as_str().unwrap().starts_with("wpkh(["));
         let (ext, _) = a.descriptors(&mut s, "bitcoin_wallet_core_module", "mock-segwit").unwrap();
         assert_eq!(ext, got["external"].as_str().unwrap());
