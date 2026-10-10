@@ -1,0 +1,23 @@
+name: Windows
+
+# The entire per-repo cost of Windows CI. The Nix install and cache, the
+# target-existence guard, the cold-cache refusal, the PE-format and
+# import-closure gates, and the artifact hand-off all live once in
+# logos-co/logos-windows-ci.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: default
+      # Unmeasured for this repo: keystore_module's 390 plus room for the signer interface's k256
+      # and bip32. Measure on the first run and tighten.
+      cold-derivation-budget: 430
+      # No smoke: a module plugin has no entry point to run here; a consumer's job loads it.
