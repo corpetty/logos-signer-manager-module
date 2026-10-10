@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 use logos_signer_interface::{json as signer_json, Account, ErrorCode, JobStatus, SignRequest, Signature, Signer, SignerError, SignerInfo};
 
-use crate::access::{Access, Cover, Decision, KeyHolder, Terms, Unlocked};
+use crate::access::{Access, Cover, Decision, KeyHolder, OpenedWallet, Terms, Unlocked};
 use crate::approval::{Approvals, Approved, Move};
 use crate::gate;
 use crate::registry::Registry;
@@ -58,8 +58,9 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     // ── Opening and unlocking: asked by any named module, decided by the custodian ──
     /// Ask a person to open a Bitcoin wallet for the caller: `{ group, network? }` to reopen one, or
     /// `{ family, network }` to let the person pick, create or restore one, with optional `unlock`
-    /// terms and a `reason` → `{ ok, handle, receipt, state }`. `fetch_result` then returns `{ group,
-    /// family, chain, network, external, internal, fingerprint, databaseKey, unlocked }`. Tier B.
+    /// terms and a `reason` → `{ ok, handle, receipt, state }`. `fetch_result` then returns `{ ok,
+    /// result: { group, family, chain, network, external, internal, fingerprint, databaseKey, origin,
+    /// birthday, unlocked } }`. Tier B.
     fn request_open(&self, params_json: String) -> String;
     /// Ask for an account to stay unlocked: `{ account, ttlMs?, count?, apps?, confirm?, reason? }`
     /// → `{ ok, handle, receipt, state }`. The person decides the terms. Tier B.
@@ -205,12 +206,20 @@ fn keystore_reply(reply: Result<String, logos_rust_sdk::LogosError>) -> crate::R
     Ok(logos_signer_interface::wire::parse_reply(&reply)?)
 }
 
+/// `YYYY-MM-DD`, as the keystore writes a birthday; anything else is dropped, not passed on.
+fn is_day(s: &str) -> bool {
+    s.len() == 10 && s.bytes().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() })
+}
+
 impl KeyHolder for KeystoreKeys {
-    fn database_key(&mut self, group: &str, password: Option<&str>) -> crate::Result<Zeroizing<String>> {
+    fn database_key(&mut self, group: &str, password: Option<&str>) -> crate::Result<OpenedWallet> {
         let body = Zeroizing::new(json!({ "group": group, "password": password }).to_string());
         let v = keystore_reply(modules().keystore_module.database_key(&body))?;
         let key = v.get("databaseKey").and_then(|k| k.as_str()).unwrap_or_default();
-        Ok(Zeroizing::new(key.to_string()))
+        // A keystore from before origins were kept says neither: the wallet core then scans the most.
+        let origin = v.get("origin").and_then(|o| o.as_str()).filter(|o| *o == "created").unwrap_or("restored");
+        let birthday = v.get("birthday").and_then(|b| b.as_str()).filter(|b| is_day(b)).map(str::to_string);
+        Ok(OpenedWallet { database_key: Zeroizing::new(key.to_string()), origin: origin.into(), birthday })
     }
 
     fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> crate::Result<Unlocked> {
