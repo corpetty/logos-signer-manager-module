@@ -744,6 +744,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unlock_ends_here_when_the_keystore_ends_it_and_one_lock_leaves_the_rest() {
+        let (mut s, mut k, mut a) = fixture();
+        let acct = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+        let terms = Terms { ttl_ms: Some(60_000), count: Some(2), apps: vec!["game".into()], confirm: true };
+        a.unlock(&mut s, &mut k, acct, "pw", &terms).unwrap();
+        // The keystore answered `locked`: its time or count ran out first.
+        a.expired(acct);
+        assert_eq!(a.covers(acct, "game"), Cover::No);
+        // The keystore dropped it on its own: the next listing drops this module's terms too.
+        a.unlock(&mut s, &mut k, acct, "pw", &terms).unwrap();
+        k.unlocks.clear();
+        assert!(a.unlocked(&mut k).unwrap().is_empty());
+        assert_eq!(a.covers(acct, "game"), Cover::No);
+        // Locking one account leaves the others unlocked.
+        a.unlock(&mut s, &mut k, acct, "pw", &terms).unwrap();
+        a.unlock(&mut s, &mut k, "mock-segwit", "pw", &terms).unwrap();
+        assert_eq!(a.lock(&mut k, Some(acct)).unwrap(), 1);
+        assert_eq!((a.covers(acct, "game"), a.covers("mock-segwit", "game")), (Cover::No, Cover::Confirmed));
+    }
+
+    #[test]
     fn a_requester_cannot_flood_the_custodian() {
         let (mut s, _, mut a) = fixture();
         for _ in 0..MAX_PENDING_PER_REQUESTER {
