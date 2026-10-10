@@ -1,0 +1,22 @@
+{
+  "name": "mock_device_signer",
+  "version": "1.0.0",
+  "description": "Doc-test fixture: a signer module behind logos.signer/1 that behaves like a device. Its jobs wait until a button is pressed, and it can answer wrong on purpose, so the manager's device path can be tested with no hardware.",
+  "author": "Logos Core Team",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "test",
+  "main": "mock_device_signer_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "MockDeviceSignerModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}
