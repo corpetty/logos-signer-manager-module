@@ -21,90 +21,90 @@ use crate::registry::Registry;
 use crate::ManagerError;
 
 /// The signer manager's IPC contract.
-pub trait SignerManagerModule: Send + 'static {
+pub trait SignerManagerModule: Send + Sync + 'static {
     /// Name the roles and the signer modules consulted: `{ approvers?, custodians?, signers? }` →
     /// `{ ok, approvers, custodians, signers }`. TOTAL — what the document doesn't name is held by
     /// nobody — and effective at once. UNGATED for now, as keystore_module's: see docs/specs.md.
-    fn configure(&mut self, config_json: String) -> String;
+    fn configure(&self, config_json: String) -> String;
 
     // ── Tier B: any NAMED module may ask ────────────────────────────────
     /// Ask a person to approve signing; returns at once with `{ ok, handle, receipt, state }`.
     /// The handle is announced on the event plane; the receipt, returned once, authorises collecting.
-    fn request_approval(&mut self, intent_json: String) -> String;
+    fn request_approval(&self, intent_json: String) -> String;
     /// `{ ok, state, reason? }`: offered, rendered, signing or settled. Never the intent or results.
-    fn approval_status(&mut self, handle: String, receipt: String) -> String;
+    fn approval_status(&self, handle: String, receipt: String) -> String;
     /// `{ ok, signed: [...] }`, idempotent until `ack_result`.
-    fn fetch_result(&mut self, handle: String, receipt: String) -> String;
+    fn fetch_result(&self, handle: String, receipt: String) -> String;
     /// The requester has the results; erase them.
-    fn ack_result(&mut self, handle: String, receipt: String) -> bool;
+    fn ack_result(&self, handle: String, receipt: String) -> bool;
     /// The requester gave up; a signer still working is told to stop.
-    fn cancel_approval(&mut self, handle: String, receipt: String) -> bool;
+    fn cancel_approval(&self, handle: String, receipt: String) -> bool;
 
     // ── Tier A: the configured approver only ────────────────────────────
     /// Queue summaries, never leg detail: `{ ok, pending: [{ handle, requester, state, purpose,
     /// legs, ageMs, error? }] }`.
-    fn pending(&mut self) -> String;
+    fn pending(&self) -> String;
     /// Claim a request for display: `{ ok, handle, bundle_id, requester, claim_lines,
-    /// render_lines, signer, collects, unlocked }`. `collects` says what `approve` must carry,
+    /// render_lines, signer, collects, account, unlocked }`. `collects` says what `approve` must carry,
     /// unless `unlocked`, when an unlock covers the request and no password is needed.
-    fn acknowledge(&mut self, handle: String) -> String;
+    fn acknowledge(&self, handle: String) -> String;
     /// The person said yes: `{ ok, signed_count }` once signed, or `{ ok, state: "signing" }` while a
     /// device works. A wrong password answers `{ ok: false, code: "wrong_secret" }` and the request
     /// stays on screen. `password` is the vault password or a card's PIN, or empty.
-    fn approve(&mut self, handle: String, bundle_id: String, password: String) -> String;
+    fn approve(&self, handle: String, bundle_id: String, password: String) -> String;
     /// The person said no.
-    fn reject(&mut self, handle: String) -> bool;
+    fn reject(&self, handle: String) -> bool;
 
     // ── Opening and unlocking: asked by any named module, decided by the custodian ──
     /// Ask a person to open a Bitcoin wallet for the caller: `{ group, network? }` to reopen one, or
     /// `{ family, network }` to let the person pick, create or restore one, with optional `unlock`
     /// terms and a `reason` → `{ ok, handle, receipt, state }`. `fetch_result` then returns `{ group,
     /// family, chain, network, external, internal, fingerprint, databaseKey, unlocked }`. Tier B.
-    fn request_open(&mut self, params_json: String) -> String;
+    fn request_open(&self, params_json: String) -> String;
     /// Ask for an account to stay unlocked: `{ account, ttlMs?, count?, apps?, confirm?, reason? }`
     /// → `{ ok, handle, receipt, state }`. The person decides the terms. Tier B.
-    fn request_unlock(&mut self, params_json: String) -> String;
+    fn request_unlock(&self, params_json: String) -> String;
     /// The custodian's queue: `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }`. Tier D.
-    fn access_requests(&mut self) -> String;
+    fn access_requests(&self) -> String;
     /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked }`. `asked` is
     /// `{ group, family, network, unlock }` for an open and `{ account, terms }` for an unlock. Tier D.
-    fn acknowledge_access(&mut self, handle: String) -> String;
+    fn acknowledge_access(&self, handle: String) -> String;
     /// The person decided: `{ handle, bundle_id, group?, password, unlock? }` → `{ ok }`, or
     /// `{ ok: false, code: "wrong_secret" }` with the request left on screen. Tier D.
-    fn approve_access(&mut self, params_json: String) -> String;
+    fn approve_access(&self, params_json: String) -> String;
     /// The person said no. Tier D.
-    fn reject_access(&mut self, handle: String) -> bool;
+    fn reject_access(&self, handle: String) -> bool;
     /// An open wallet's descriptors again: `{ ok, group, external, internal }`, only for a module
     /// the wallet is open for.
-    fn account_descriptors(&mut self, group: String) -> String;
+    fn account_descriptors(&self, group: String) -> String;
     /// Close a wallet: `{ group }` for the caller's own, or as the custodian `{ group, module }` →
     /// `{ ok, closed }`. An unlock scoped to that module alone ends with it.
-    fn close_account(&mut self, params_json: String) -> String;
+    fn close_account(&self, params_json: String) -> String;
     /// Every open wallet and its module: `{ ok, open: [{ module, group }] }`. Tier D.
-    fn open_accounts(&mut self) -> String;
+    fn open_accounts(&self) -> String;
     /// The person's own unlock, from the keys app: `{ account, password, ttlMs?, count?, apps,
     /// confirm? }` → `{ ok, account, expiresInMs, countLeft }`. Tier D.
-    fn unlock(&mut self, params_json: String) -> String;
+    fn unlock(&self, params_json: String) -> String;
     /// `{ account? }`, every account for `{}` → `{ ok, locked }`. Tier D.
-    fn lock(&mut self, params_json: String) -> String;
+    fn lock(&self, params_json: String) -> String;
     /// `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm }] }`. Approver and custodian.
-    fn unlocked(&mut self) -> String;
+    fn unlocked(&self) -> String;
     /// Requests signed without being shown: `{ ok, signed: [{ handle, requester, account, ageMs }] }`.
     /// Approver and custodian.
-    fn unattended_signatures(&mut self) -> String;
+    fn unattended_signatures(&self) -> String;
 
     // ── Tier C: ungated reads ───────────────────────────────────────────
     /// Every signer's accounts, each under the first signer that offers it: `{ ok, accounts: [{
     /// id, family, chain?, address?, label?, signer, available }] }`. No xpub: it would show a
     /// Bitcoin wallet's whole history to anyone who asked.
-    fn accounts(&mut self) -> String;
+    fn accounts(&self) -> String;
     /// The signer modules consulted, with what each says it is: `{ ok, signers: [{ name, info? }] }`.
-    fn signers(&mut self) -> String;
+    fn signers(&self) -> String;
     /// What this module sees as its caller, with the roles and signers in force:
     /// `{ ok, kind, identity, approvers, custodians, signers }`.
-    fn caller_identity(&mut self) -> String;
+    fn caller_identity(&self) -> String;
     /// Framework hook — defaulted, so not part of the IPC contract.
-    fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
+    fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
 
 /// Typed events. Payloads carry handles only: the event plane is unauthenticated.
@@ -241,8 +241,21 @@ struct Unattended {
     at: std::time::Instant,
 }
 
+/// The module: one lock around its state. Concurrency is "multi", so each call runs on a worker
+/// thread and waits there for the lock, never nested on the main thread an outbound call needs.
 #[derive(Default)]
 struct SignerManagerModuleImpl {
+    core: std::sync::Mutex<Core>,
+}
+
+impl SignerManagerModuleImpl {
+    fn core(&self) -> std::sync::MutexGuard<'_, Core> {
+        self.core.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[derive(Default)]
+struct Core {
     approvals: Approvals,
     access: Access,
     unattended: Vec<Unattended>,
@@ -270,7 +283,7 @@ fn not_authorized() -> String {
     json!({ "ok": false, "error": "not authorized" }).to_string()
 }
 
-impl SignerManagerModuleImpl {
+impl Core {
     fn caller() -> gate::Caller {
         match logos_rust_sdk::current_caller() {
             logos_rust_sdk::LogosCaller::Unknown => gate::Caller::Unknown,
@@ -334,7 +347,7 @@ impl SignerManagerModuleImpl {
     }
 }
 
-impl SignerManagerModule for SignerManagerModuleImpl {
+impl Core {
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {
         self.bind_signers();
         // The terms of any unlock were kept here and are gone: nothing stays unlocked past a restart.
@@ -784,6 +797,116 @@ impl SignerManagerModule for SignerManagerModuleImpl {
         json!({ "ok": true, "kind": kind, "identity": name, "approvers": self.roles.approvers,
                 "custodians": self.roles.custodians, "signers": self.roles.signers })
         .to_string()
+    }
+}
+
+impl SignerManagerModule for SignerManagerModuleImpl {
+    fn on_context_ready(&self, ctx: &RustModuleContext) {
+        self.core().on_context_ready(ctx)
+    }
+
+    fn ack_result(&self, handle: String, receipt: String) -> bool {
+        self.core().ack_result(handle, receipt)
+    }
+
+    fn cancel_approval(&self, handle: String, receipt: String) -> bool {
+        self.core().cancel_approval(handle, receipt)
+    }
+
+    fn reject(&self, handle: String) -> bool {
+        self.core().reject(handle)
+    }
+
+    fn reject_access(&self, handle: String) -> bool {
+        self.core().reject_access(handle)
+    }
+
+    fn configure(&self, config_json: String) -> String {
+        self.core().configure(config_json)
+    }
+
+    fn request_approval(&self, intent_json: String) -> String {
+        self.core().request_approval(intent_json)
+    }
+
+    fn approval_status(&self, handle: String, receipt: String) -> String {
+        self.core().approval_status(handle, receipt)
+    }
+
+    fn fetch_result(&self, handle: String, receipt: String) -> String {
+        self.core().fetch_result(handle, receipt)
+    }
+
+    fn pending(&self) -> String {
+        self.core().pending()
+    }
+
+    fn acknowledge(&self, handle: String) -> String {
+        self.core().acknowledge(handle)
+    }
+
+    fn approve(&self, handle: String, bundle_id: String, password: String) -> String {
+        self.core().approve(handle, bundle_id, password)
+    }
+
+    fn request_open(&self, params_json: String) -> String {
+        self.core().request_open(params_json)
+    }
+
+    fn request_unlock(&self, params_json: String) -> String {
+        self.core().request_unlock(params_json)
+    }
+
+    fn access_requests(&self) -> String {
+        self.core().access_requests()
+    }
+
+    fn acknowledge_access(&self, handle: String) -> String {
+        self.core().acknowledge_access(handle)
+    }
+
+    fn approve_access(&self, params_json: String) -> String {
+        self.core().approve_access(params_json)
+    }
+
+    fn account_descriptors(&self, group: String) -> String {
+        self.core().account_descriptors(group)
+    }
+
+    fn close_account(&self, params_json: String) -> String {
+        self.core().close_account(params_json)
+    }
+
+    fn open_accounts(&self) -> String {
+        self.core().open_accounts()
+    }
+
+    fn unlock(&self, params_json: String) -> String {
+        self.core().unlock(params_json)
+    }
+
+    fn lock(&self, params_json: String) -> String {
+        self.core().lock(params_json)
+    }
+
+    fn unlocked(&self) -> String {
+        self.core().unlocked()
+    }
+
+    fn unattended_signatures(&self) -> String {
+        self.core().unattended_signatures()
+    }
+
+    fn accounts(&self) -> String {
+        self.core().accounts()
+    }
+
+    fn signers(&self) -> String {
+        self.core().signers()
+    }
+
+    fn caller_identity(&self) -> String {
+        self.core().caller_identity()
     }
 }
 

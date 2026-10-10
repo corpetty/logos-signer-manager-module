@@ -190,6 +190,12 @@ Signer modules are bound at runtime through the `signer` interface dependency
 is also a concrete dependency, so it loads with the manager. A signer that doesn't answer within
 three seconds for `signer_info`, or twenty for anything else, offers nothing until asked again.
 
+The manager calls its signers from inside its own methods, so it runs with `concurrency: "multi"`:
+each call has a worker thread, and the manager's state sits behind one lock. A call that arrives
+while another waits on a signer waits for that lock on its own thread. Under the default
+`"single"`, the host delivered it inside the first call's nested event loop, on the thread that
+held the lock, and the manager hung.
+
 ## Build and test
 
 ```sh
