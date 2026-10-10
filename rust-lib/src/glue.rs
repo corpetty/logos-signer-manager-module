@@ -66,7 +66,8 @@ pub trait SignerManagerModule: Send + 'static {
     fn request_unlock(&mut self, params_json: String) -> String;
     /// The custodian's queue: `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }`. Tier D.
     fn access_requests(&mut self) -> String;
-    /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines }`. Tier D.
+    /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked }`. `asked` is
+    /// `{ group, family, network, unlock }` for an open and `{ account, terms }` for an unlock. Tier D.
     fn acknowledge_access(&mut self, handle: String) -> String;
     /// The person decided: `{ handle, bundle_id, group?, password, unlock? }` → `{ ok }`, or
     /// `{ ok: false, code: "wrong_secret" }` with the request left on screen. Tier D.
@@ -570,7 +571,7 @@ impl SignerManagerModule for SignerManagerModuleImpl {
         }
         match self.access.acknowledge(&handle) {
             Ok(v) => json!({ "ok": true, "handle": v.handle, "requester": v.requester, "kind": v.kind,
-                             "bundle_id": v.bundle_id, "lines": v.lines })
+                             "bundle_id": v.bundle_id, "lines": v.lines, "asked": v.asked })
             .to_string(),
             Err(e) => err(e),
         }

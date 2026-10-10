@@ -194,6 +194,9 @@ pub struct Shown {
     pub kind: &'static str,
     pub bundle_id: String,
     pub lines: Vec<String>,
+    /// What was asked, for the keys app to offer: the wallet or the family and network to pick
+    /// from, and the terms an app wants. Never the reason, which is in `lines` as a claim.
+    pub asked: serde_json::Value,
 }
 
 pub struct Summary {
@@ -395,6 +398,11 @@ impl Access {
             },
             bundle_id: hex::encode(r.bundle_id),
             lines: r.lines.clone(),
+            asked: match &r.kind {
+                Kind::Open(p) => serde_json::json!({ "group": p.group, "family": p.family, "network": p.network,
+                                                     "unlock": p.unlock }),
+                Kind::Unlock(p) => serde_json::json!({ "account": p.account, "terms": p.terms() }),
+            },
         })
     }
 
@@ -673,6 +681,7 @@ pub(crate) mod tests {
         let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"family":"bitcoin","network":"signet"}"#).unwrap();
         let shown = a.acknowledge(&h).unwrap();
         assert!(shown.lines.join("\n").contains("Any native segwit wallet on signet"), "{:?}", shown.lines);
+        assert_eq!(shown.asked, serde_json::json!({ "group": null, "family": "bitcoin", "network": "signet", "unlock": null }));
         assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).is_err(), "no wallet picked");
         assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-taproot"), "pw", None)).is_err(), "wrong family");
         assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "nope", None)).is_err());

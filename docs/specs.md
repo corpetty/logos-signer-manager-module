@@ -91,7 +91,7 @@ false signature past the checks above.
 | `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, signers }`: everything a total `configure` must repeat |
 | `request_open`, `request_unlock` | `params_json` | `{ ok, handle, receipt, state }` |
 | `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }` |
-| `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines }` |
+| `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines, asked }` |
 | `approve_access` | `params_json` | `{ ok }`, or `{ ok: false, code, error }` |
 | `reject_access` | `handle` | `bool` |
 | `account_descriptors` | `group` | `{ ok, group, external, internal }` |
@@ -151,7 +151,8 @@ wallet for it in the keys app, and an account stays unlocked only on terms a per
 - `request_unlock` takes `{ account, ttlMs?, count?, apps?, confirm?, reason? }`, the terms an app
   asks for. `fetch_result` returns the terms the person granted, which may differ.
 - The custodian (the keys app) works the queue with `access_requests`, `acknowledge_access` (the
-  lines to show and the commitment to echo), `approve_access` (`{ handle, bundle_id, group?,
+  lines to show, the commitment to echo, and `asked`: the wallet or the family and network to pick
+  from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?,
   password, unlock? }`) and `reject_access`. A wrong password answers `code: wrong_secret` and
   leaves the request on screen. The database key comes from the keystore's `database_key`, the
   unlock from its `unlock`; the manager keeps neither.
