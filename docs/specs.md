@@ -23,6 +23,7 @@ requester or an approver changes only the module it calls.
 2. The approver (the signer app, `evm_signer_ui`) calls `pending` and `acknowledge`. It gets
    the manager's own lines, the requester's claim apart from them, the commitment to echo
    back, the signer's name, and what that signer collects: a password, a PIN, or nothing.
+   `unlocked` says an unlock covers the request, so the person approves without a password.
 3. The person approves. `approve` re-derives the commitment and checks the echo. It then
    computes one digest per item and calls the signer's `sign`, passing the password only
    when one was typed:
@@ -82,7 +83,7 @@ false signature past the checks above.
 | `ack_result` | `handle, receipt` | `bool` |
 | `cancel_approval` | `handle, receipt` | `bool`; a signer still working is told to stop |
 | `pending` | — | `{ ok, pending: [{ handle, requester, state, purpose, legs, ageMs, error? }] }` |
-| `acknowledge` | `handle` | `{ ok, handle, bundle_id, requester, claim_lines, render_lines, signer, collects }` |
+| `acknowledge` | `handle` | `{ ok, handle, bundle_id, requester, claim_lines, render_lines, signer, collects, unlocked }` |
 | `approve` | `handle, bundle_id, password` | `{ ok, signed_count }`, or `{ ok, state: "signing" }`, or `{ ok: false, code, error }` |
 | `reject` | `handle` | `bool` |
 | `accounts` | — | `{ ok, accounts: [{ id, family, chain?, address?, label?, signer, available }] }` |
@@ -138,10 +139,12 @@ missing, or one that fails, adds none.
 A Bitcoin wallet's descriptors and database key reach a module only once a person opens the
 wallet for it in the keys app, and an account stays unlocked only on terms a person chose.
 
-- `request_open` takes `{ group }` to reopen a wallet, or `{ family, network }` to let the person
-  pick, create or restore one, with optional `unlock` terms and a `reason`. It answers `{ ok,
-  handle, receipt, state }`. Once the custodian approves, `fetch_result` with the receipt returns
-  `{ group, family, chain, external, internal, fingerprint, databaseKey, unlocked }`, and the
+- `request_open` takes `{ group, network? }` to reopen a wallet, or `{ family, network }` to let the
+  person pick, create or restore one, with optional `unlock` terms and a `reason`. A network must
+  belong to the wallet's chain (`main` or `test`); a request naming the wrong one is refused before
+  anything is shown. It answers `{ ok, handle, receipt, state }`. Once the custodian approves,
+  `fetch_result` with the receipt returns `{ group, family, chain, network, external, internal,
+  fingerprint, databaseKey, unlocked }`, `network` being the one the request named, and the
   wallet is **open** for that module: `account_descriptors` (`{ group }` → `{ ok, group, external,
   internal }`) answers it again, and nobody else. `close_account` (`{ group }`) ends that; an unlock
   scoped to the module alone ends with it.

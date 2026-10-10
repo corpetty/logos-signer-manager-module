@@ -45,7 +45,8 @@ pub trait SignerManagerModule: Send + 'static {
     /// legs, ageMs, error? }] }`.
     fn pending(&mut self) -> String;
     /// Claim a request for display: `{ ok, handle, bundle_id, requester, claim_lines,
-    /// render_lines, signer, collects }`. `collects` says what `approve` must carry.
+    /// render_lines, signer, collects, unlocked }`. `collects` says what `approve` must carry,
+    /// unless `unlocked`, when an unlock covers the request and no password is needed.
     fn acknowledge(&mut self, handle: String) -> String;
     /// The person said yes: `{ ok, signed_count }` once signed, or `{ ok, state: "signing" }` while a
     /// device works. A wrong password answers `{ ok: false, code: "wrong_secret" }` and the request
@@ -55,10 +56,10 @@ pub trait SignerManagerModule: Send + 'static {
     fn reject(&mut self, handle: String) -> bool;
 
     // ── Opening and unlocking: asked by any named module, decided by the custodian ──
-    /// Ask a person to open a Bitcoin wallet for the caller: `{ group }` to reopen one, or `{ family,
-    /// network }` to let the person pick, create or restore one, with optional `unlock` terms and a
-    /// `reason` → `{ ok, handle, receipt, state }`. `fetch_result` then returns `{ group, family,
-    /// chain, external, internal, fingerprint, databaseKey, unlocked }`. Tier B.
+    /// Ask a person to open a Bitcoin wallet for the caller: `{ group, network? }` to reopen one, or
+    /// `{ family, network }` to let the person pick, create or restore one, with optional `unlock`
+    /// terms and a `reason` → `{ ok, handle, receipt, state }`. `fetch_result` then returns `{ group,
+    /// family, chain, network, external, internal, fingerprint, databaseKey, unlocked }`. Tier B.
     fn request_open(&mut self, params_json: String) -> String;
     /// Ask for an account to stay unlocked: `{ account, ttlMs?, count?, apps?, confirm?, reason? }`
     /// → `{ ok, handle, receipt, state }`. The person decides the terms. Tier B.
@@ -468,9 +469,10 @@ impl SignerManagerModule for SignerManagerModuleImpl {
         }
         self.refresh();
         match self.approvals.acknowledge(&mut self.signers, &handle) {
+            // `unlocked`: an unlock covers this request, so `approve` needs no password.
             Ok(v) => json!({ "ok": true, "handle": v.handle, "bundle_id": v.bundle_id, "requester": v.requester,
                              "claim_lines": v.claim_lines, "render_lines": v.render_lines,
-                             "signer": v.signer, "collects": v.collects })
+                             "signer": v.signer, "collects": v.collects, "unlocked": self.cover(&handle) != Cover::No })
             .to_string(),
             Err(e) => err(e),
         }

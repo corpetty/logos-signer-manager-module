@@ -306,11 +306,19 @@ impl Access {
         }
         let mut lines = vec![format!("{requester} asks to open a Bitcoin wallet")];
         match (&p.group, &p.family, &p.network) {
-            (Some(g), None, None) => {
+            (Some(g), None, n) => {
                 let found = signers.find(g)?;
                 let acct = AccountPublic::from_account(&found.account)?;
                 let name = found.account.label.clone().unwrap_or_else(|| found.account.id.clone());
-                lines.push(format!("Wallet: {name} ({}, {} chain)", acct.family.describe(), acct.chain.as_str()));
+                let on = match n {
+                    Some(n) => {
+                        check_displayable(n, "network")?;
+                        acct.chain.network(n)?;
+                        format!(" on {n}")
+                    }
+                    None => String::new(),
+                };
+                lines.push(format!("Wallet: {name} ({}, {} chain){on}", acct.family.describe(), acct.chain.as_str()));
             }
             (None, Some(f), Some(n)) if f.is_bitcoin() => {
                 let family = if *f == Family::Bitcoin { "native segwit" } else { "taproot" };
@@ -438,7 +446,7 @@ impl Access {
                     None => None,
                 };
                 let result = serde_json::json!({
-                    "group": group, "family": found.account.family, "chain": acct.chain.as_str(),
+                    "group": group, "family": found.account.family, "chain": acct.chain.as_str(), "network": p.network,
                     "external": acct.descriptor(0), "internal": acct.descriptor(1),
                     "fingerprint": acct.fingerprint.to_string(), "databaseKey": database_key.as_str(),
                     "unlocked": terms,
@@ -639,6 +647,22 @@ pub(crate) mod tests {
         (r, FakeKeys::default(), Access::new())
     }
 
+    #[test]
+    fn reopening_a_wallet_may_name_its_network_and_a_wrong_one_is_refused_up_front() {
+        let (mut s, mut k, mut a) = fixture();
+        let req = |n: &str| format!(r#"{{"group":"mock-segwit","network":"{n}"}}"#);
+        assert!(a.request_open(&mut s, "bitcoin_wallet_core_module", &req("bitcoin")).is_err(), "a test wallet on mainnet");
+        let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", &req("regtest")).unwrap();
+        let shown = a.acknowledge(&h).unwrap();
+        assert!(shown.lines.iter().any(|l| l.ends_with("test chain) on regtest")), "{:?}", shown.lines);
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).unwrap();
+        assert_eq!(a.fetch(&h, &r).unwrap()["network"], "regtest");
+        let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"group":"mock-segwit"}"#).unwrap();
+        let shown = a.acknowledge(&h).unwrap();
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).unwrap();
+        assert!(a.fetch(&h, &r).unwrap()["network"].is_null(), "named nothing, echoes nothing");
+    }
+
     fn decide(group: Option<&str>, password: &str, unlock: Option<Terms>) -> Decision {
         Decision { group: group.map(str::to_string), password: password.into(), unlock }
     }
@@ -656,6 +680,7 @@ pub(crate) mod tests {
         a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "pw", None)).unwrap();
         let got = a.fetch(&h, &r).unwrap();
         assert_eq!(got["group"], "mock-segwit");
+        assert_eq!((got["chain"].as_str(), got["network"].as_str()), (Some("test"), Some("signet")));
         assert_eq!(got["databaseKey"], "ab".repeat(32));
         assert!(got["external"].as_str().unwrap().starts_with("wpkh(["));
         let (ext, _) = a.descriptors(&mut s, "bitcoin_wallet_core_module", "mock-segwit").unwrap();
