@@ -1,0 +1,25 @@
+{
+  "name": "signer_manager_module",
+  "version": "0.1.0",
+  "description": "Signer manager: takes signature requests, shows them through the signer app, and has each account's signer sign. Holds no keys.",
+  "author": "Logos Core Team",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "main": "signer_manager_module_plugin",
+  "dependencies": ["keystore_module"],
+  "interface_dependencies": [
+    { "name": "signer", "input": "logos-signer-interface", "file": "signer.lidl" }
+  ],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "SignerManagerModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}

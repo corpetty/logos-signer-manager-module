@@ -1,0 +1,52 @@
+name: signer-manager-module Unit Tests
+
+# The approval state machine, the EVM and PSBT readers, the registry and the gate, against the
+# signer interface's mock signer. `--no-default-features` drops the Logos glue, but cargo still
+# resolves the SDK's manifest, so it is checked out beside the crate.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (pure core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-lib's rust-version, the builder's rustc: a pass here can't fail the real build on MSRV.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+      - name: Provide the SDK manifest cargo resolves
+        uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          path: logos-rust-sdk-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+      - name: cargo test --no-default-features
+        # Zero tests also reports success, so the count must be above zero.
+        run: |
+          set -o pipefail
+          cd rust-lib
+          cargo test --locked --no-default-features 2>&1 | tee /tmp/unit.log
+          ran=$(grep -oE '^test result: ok\. [0-9]+ passed' /tmp/unit.log | awk '{s+=$4} END {print s+0}')
+          echo "tests run: $ran"
+          [ "$ran" -gt 0 ]
+      - name: Every contract method must be documented
+        run: |
+          methods=$(grep -E '^    fn [a-z_]+\(.*;$' rust-lib/src/glue.rs | grep -oE 'fn [a-z_]+' | awk '{print $2}' | sort -u)
+          missing=0
+          for m in $methods; do
+            grep -q "\`$m\`" docs/specs.md || { echo "UNDOCUMENTED: $m"; missing=1; }
+          done
+          echo "checked $(echo "$methods" | wc -w) contract methods"
+          exit $missing

@@ -1,0 +1,251 @@
+name: "Signing Through the Signer Manager"
+output: signer-manager-runtime.md
+release: ""
+
+intro: |
+  `signer_manager_module` takes signature requests from any named module, shows them to a person
+  through the signer app, and has the account's signer sign. It holds no keys: `keystore_module`
+  signs for keys kept in files, behind the signer interface every signer implements, and the
+  manager checks every signature before anyone can collect it.
+
+  This doc-test runs the whole round trip headlessly through `logoscore`. A small fixture module,
+  `manager_probe`, plays three parts the apps play in Basecamp: the keystore's custodian, a
+  requester, and the manager's approver. Everything is offline and deterministic.
+
+what_you_build: "The signer manager and the keystore, installed with `lgpm` and driven through a `logoscore` daemon."
+
+what_you_learn:
+  - How the manager finds an account's signer through the signer interface
+  - What an approver is shown, and what it must send back
+  - Why a wrong password leaves a request on screen instead of failing it
+  - Why nothing but the manager can ask the keystore to sign
+
+prerequisites:
+  - "**Nix** with flakes enabled."
+  - "**A Linux or macOS machine.** Everything here is offline."
+
+sections:
+  - title: "Build logoscore and lgpm"
+    step: true
+    steps:
+      - title: "Build logoscore"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        check_file: "logos/bin/logoscore"
+      - title: "Prove the CLI runs"
+        run: "./logos/bin/logoscore --version"
+        code_block: "logoscore --version"
+        expect_contains:
+          - "logoscore version"
+      - title: "Build lgpm"
+        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
+        check_file: "lgpm/bin/lgpm"
+
+  - title: "Build and install the modules"
+    step: true
+    text: |
+      The keystore is pinned to the commit that made it a signer. The probe is a subflake of the
+      commit under test, pointed at this manager and that keystore.
+    steps:
+      - title: "Build the keystore, the manager and the probe"
+        run: |
+          nix build 'github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1#lgx' --no-write-lock-file -o keystore-lgx
+          nix build 'github:logos-co/logos-signer-manager-module{release}#lgx' --no-write-lock-file -o manager-lgx
+          nix build 'github:logos-co/logos-signer-manager-module{release}?dir=doctests/manager-probe#lgx' --override-input signer_manager_module 'github:logos-co/logos-signer-manager-module{release}' --override-input keystore_module 'github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1' --no-write-lock-file -o probe-lgx
+          ls keystore-lgx/*.lgx manager-lgx/*.lgx probe-lgx/*.lgx
+        code_block: |
+          # From inside the clone:
+          nix build '.#lgx' -o manager-lgx
+          nix build './doctests/manager-probe#lgx' -o probe-lgx
+        expect_contains:
+          - "manager_probe"
+      - title: "Install them"
+        run: |
+          mkdir -p modules
+          cp -RL ./logos/modules/. ./modules/
+          chmod -R u+w modules
+          ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file keystore-lgx/*.lgx
+          ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file manager-lgx/*.lgx
+          ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file probe-lgx/*.lgx
+          ./lgpm/bin/lgpm --modules-dir ./modules list
+        expect_contains:
+          - "keystore_module"
+          - "signer_manager_module"
+          - "manager_probe"
+
+  - title: "Run the daemon and name the roles"
+    step: true
+    steps:
+      - title: "Start the daemon"
+        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
+        code_block: "logoscore -D -m ./modules > logs.txt &"
+      - run: "sleep 3"
+      - title: "Load the probe, which loads the manager and the keystore"
+        run: "./logos/bin/logoscore load-module manager_probe"
+        code_block: "logoscore load-module manager_probe"
+        expect_contains:
+          - "signer_manager_module"
+          - "keystore_module"
+      - title: "Name the roles"
+        text: |
+          The keystore's custodian administers its key files, and only its manager may ask it to sign.
+          The manager's approver is what the signer app is in Basecamp, its custodian what the keys
+          app is, and its signers the modules it consults. Here the probe plays every app.
+        run: |
+          ./logos/bin/logoscore call keystore_module configure '{"approvers":"evm_signer_ui","custodians":"manager_probe","managers":"signer_manager_module"}'
+          ./logos/bin/logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":"keystore_module"}'
+        code_block: |
+          logoscore call keystore_module configure '{"custodians":"manager_probe","managers":"signer_manager_module", …}'
+          logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":"keystore_module"}'
+        expect_contains:
+          - '\"managers\":[\"signer_manager_module\"]'
+          - '\"signers\":[\"keystore_module\"]'
+      - title: "The manager reaches the keystore through the signer interface"
+        run: "./logos/bin/logoscore call signer_manager_module signers"
+        code_block: "logoscore call signer_manager_module signers"
+        expect_contains:
+          - "logos.signer/1"
+          - '\"kind\":\"keystore\"'
+
+  - title: "A signature, end to end"
+    step: true
+    text: |
+      Foundry's well-known test key (account 0, `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`) goes
+      into the keystore, and the manager lists it under the keystore as its signer.
+    steps:
+      - title: "Import a key, as the keystore's custodian"
+        run: |
+          ./logos/bin/logoscore call manager_probe import_key ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 pw
+          ./logos/bin/logoscore call signer_manager_module accounts
+        code_block: |
+          logoscore call manager_probe import_key <private key> pw
+          logoscore call signer_manager_module accounts
+        expect_contains:
+          - '\"signer\":\"keystore_module\"'
+          - "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+      - title: "The CLI can't ask"
+        text: "Asking is for named modules; the CLI is not one."
+        run: "./logos/bin/logoscore call signer_manager_module request_approval '{\"address\":\"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\",\"legs\":[{\"kind\":\"message\",\"text\":\"hello-logos\"}]}'"
+        code_block: "logoscore call signer_manager_module request_approval '{...}'"
+        expect_contains:
+          - "not authorized"
+      - title: "Ask, as a requester, and show it, as the approver"
+        text: |
+          The approver gets the manager's own lines, the requester's claim apart from them, the
+          commitment to echo back, the signer, and what that signer needs: a password.
+        run: |
+          ./logos/bin/logoscore call manager_probe request '{"address":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","purpose":"doc-test","legs":[{"kind":"message","text":"hello-logos"}]}' > request.json
+          python3 -c 'import json; r = json.loads(json.load(open("request.json"))["result"]); open("handle", "w").write(r["handle"]); open("receipt", "w").write(r["receipt"])'
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat handle)" > shown.json
+          python3 -c 'import json; open("bundle", "w").write(json.loads(json.load(open("shown.json"))["result"])["bundle_id"])'
+          cat shown.json
+        code_block: |
+          logoscore call manager_probe request '{"address":"0xf39F…2266","purpose":"doc-test","legs":[{"kind":"message","text":"hello-logos"}]}'
+          logoscore call manager_probe acknowledge <handle>
+        expect_contains:
+          - "Sign text message"
+          - "Text: hello-logos"
+          - "Purpose (claimed by the requester): doc-test"
+          - '\"collects\":\"password\"'
+          - '\"signer\":\"keystore_module\"'
+      - title: "A wrong password signs nothing and leaves the request on screen"
+        run: |
+          ./logos/bin/logoscore call manager_probe approve "$(cat handle)" "$(cat bundle)" wrong
+          ./logos/bin/logoscore call manager_probe status "$(cat handle)" "$(cat receipt)"
+        code_block: |
+          logoscore call manager_probe approve <handle> <bundle_id> wrong
+          logoscore call manager_probe status <handle> <receipt>
+        expect_contains:
+          - '\"code\":\"wrong_secret\"'
+          - '\"state\":\"rendered\"'
+      - title: "The right one signs, and the requester collects"
+        text: |
+          The keystore signs the digest the manager computed; the manager checks the signature
+          recovers to the account and returns it. It is byte for byte what the keystore returned
+          when it signed messages itself.
+        run: |
+          ./logos/bin/logoscore call manager_probe approve "$(cat handle)" "$(cat bundle)" pw
+          ./logos/bin/logoscore call manager_probe fetch "$(cat handle)" "$(cat receipt)"
+        code_block: |
+          logoscore call manager_probe approve <handle> <bundle_id> pw
+          logoscore call manager_probe fetch <handle> <receipt>
+        expect_contains:
+          - '\"signed_count\":1'
+          - "0x0eb9f28352f7922f2cbd640d4569c5dce34e261a78413a14f029f34e3fdb6685799fe51ca446a9998cba505370e0f4e11cb8ae05d0cdef67f44fb940f04c693b1c"
+      - title: "Nothing but the manager can ask the keystore to sign"
+        text: |
+          The keystore's `sign` answers its manager alone, so neither the CLI nor another module can
+          sign past the manager, even with the right password.
+        run: |
+          ./logos/bin/logoscore call keystore_module sign '{"account":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","kind":"hash","items":[{"scheme":"evm","digest":"1111111111111111111111111111111111111111111111111111111111111111"}],"secret":"pw"}'
+          ./logos/bin/logoscore call manager_probe sign_direct '{"account":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","kind":"hash","items":[{"scheme":"evm","digest":"1111111111111111111111111111111111111111111111111111111111111111"}],"secret":"pw"}'
+        code_block: |
+          logoscore call keystore_module sign '{...}'          # refused: the CLI
+          logoscore call manager_probe sign_direct '{...}'    # refused: not the manager
+        expect_contains:
+          - "not authorized"
+
+  - title: "Opening a Bitcoin wallet"
+    step: true
+    text: |
+      A wallet's descriptors and database key reach a module only once a person opens the wallet
+      for it in the keys app. The module asks for any native segwit wallet on regtest; the person
+      picks one, here made from the same test phrase, and types its password.
+    steps:
+      - title: "Make a Bitcoin wallet, as the keystore's custodian"
+        run: |
+          ./logos/bin/logoscore call manager_probe import_bitcoin '{"phrase":"test test test test test test test test test test test junk","family":"bitcoin","chain":"test","password":"pw","label":"Savings"}' > wallet.json
+          python3 -c 'import json; open("group", "w").write(json.loads(json.load(open("wallet.json"))["result"])["group"])'
+          cat wallet.json
+        code_block: "logoscore call manager_probe import_bitcoin '{\"phrase\":\"test … junk\",\"family\":\"bitcoin\",\"chain\":\"test\",\"password\":\"pw\",\"label\":\"Savings\"}'"
+        expect_contains:
+          - "wpkh(["
+      - title: "Ask to open one, and show it, as the keys app"
+        run: |
+          ./logos/bin/logoscore call manager_probe open '{"family":"bitcoin","network":"regtest","reason":"doc-test"}' > open.json
+          python3 -c 'import json; r = json.loads(json.load(open("open.json"))["result"]); open("ohandle", "w").write(r["handle"]); open("oreceipt", "w").write(r["receipt"])'
+          ./logos/bin/logoscore call manager_probe show "$(cat ohandle)" > oshown.json
+          python3 -c 'import json; open("obundle", "w").write(json.loads(json.load(open("oshown.json"))["result"])["bundle_id"])'
+          cat oshown.json
+        code_block: |
+          logoscore call manager_probe open '{"family":"bitcoin","network":"regtest","reason":"doc-test"}'
+          logoscore call manager_probe show <handle>
+        expect_contains:
+          - "manager_probe asks to open a Bitcoin wallet"
+          - "Any native segwit wallet on regtest"
+          - "It will see every address and transaction of that wallet"
+      - title: "A wrong password opens nothing; the right one hands over the wallet"
+        run: |
+          ./logos/bin/logoscore call manager_probe decide "{\"handle\":\"$(cat ohandle)\",\"bundle_id\":\"$(cat obundle)\",\"group\":\"$(cat group)\",\"password\":\"wrong\"}"
+          ./logos/bin/logoscore call manager_probe decide "{\"handle\":\"$(cat ohandle)\",\"bundle_id\":\"$(cat obundle)\",\"group\":\"$(cat group)\",\"password\":\"pw\"}"
+          ./logos/bin/logoscore call manager_probe fetch "$(cat ohandle)" "$(cat oreceipt)"
+        code_block: |
+          logoscore call manager_probe decide '{"handle":"<handle>","bundle_id":"<bundle_id>","group":"<group>","password":"pw"}'
+          logoscore call manager_probe fetch <handle> <receipt>
+        expect_contains:
+          - '\"code\":\"wrong_secret\"'
+          - "databaseKey"
+          - "wpkh([16a93ed0/84'/1'/0']tpub"
+      - title: "Its descriptors again, for this module only"
+        run: |
+          ./logos/bin/logoscore call manager_probe descriptors "$(cat group)"
+          ./logos/bin/logoscore call signer_manager_module account_descriptors "$(cat group)"
+          ./logos/bin/logoscore call manager_probe close "$(cat group)"
+          ./logos/bin/logoscore call manager_probe descriptors "$(cat group)"
+        code_block: |
+          logoscore call manager_probe descriptors <group>                       # open for the probe
+          logoscore call signer_manager_module account_descriptors <group>       # refused: the CLI
+          logoscore call manager_probe close <group>
+          logoscore call manager_probe descriptors <group>                       # refused: closed
+        expect_contains:
+          - '\"external\":\"wpkh(['
+          - '\"closed\":true'
+          - "not authorized"
+      - title: "Stop the daemon"
+        run: "./logos/bin/logoscore stop"
+        code_block: "logoscore stop"
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logoscore status || true"
+        code_block: "logoscore status"
+        expect_contains:
+          - '"status":"not_running"'
