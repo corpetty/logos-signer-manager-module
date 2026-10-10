@@ -6,7 +6,7 @@ use std::sync::MutexGuard;
 
 use logos_signer_interface::json as signer_json;
 use logos_signer_interface::mock::{Doctor, MockOptions, MockSigner};
-use logos_signer_interface::{Payload, Signer};
+use logos_signer_interface::{Payload, RequestKind, Signer};
 use serde_json::{json, Value};
 
 const PHRASE: &str =
@@ -22,7 +22,7 @@ pub trait MockDeviceSignerModule: Send + Sync + 'static {
     fn cancel_sign(&self, job: String) -> String;
 
     // ── the device itself, for tests ────────────────────────────────────
-    /// What the device shows: `{ ok, waiting: [{ job, account, items }] }`.
+    /// What the device shows: `{ ok, waiting: [{ job, account, kind, items }] }`.
     fn screen(&self) -> String;
     /// The person presses `confirm` or `refuse` on the device for `job`.
     fn press(&self, job: String, button: String) -> String;
@@ -30,6 +30,8 @@ pub trait MockDeviceSignerModule: Send + Sync + 'static {
     fn doctor(&self, mode: String) -> String;
     /// Plug the device in or out. Its accounts stay listed, available or not.
     fn plug(&self, connected: bool) -> String;
+    /// Take whole requests from now on, as a device with a screen does, or hashes again.
+    fn whole(&self, enabled: bool) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -97,7 +99,7 @@ impl MockDeviceSignerModule for MockDeviceSignerModuleImpl {
                     Payload::Hash { items } => items.len(),
                     _ => 1,
                 };
-                json!({ "job": job, "account": req.account, "items": items })
+                json!({ "job": job, "account": req.account, "kind": req.payload.kind(), "items": items })
             })
             .collect();
         json!({ "ok": true, "waiting": waiting }).to_string()
@@ -136,6 +138,22 @@ impl MockDeviceSignerModule for MockDeviceSignerModuleImpl {
         };
         emit_signer_accounts_changed(count as i64);
         json!({ "ok": true, "connected": connected }).to_string()
+    }
+
+    fn whole(&self, enabled: bool) -> String {
+        let kinds = if enabled {
+            vec![RequestKind::EvmTransaction, RequestKind::EvmMessage, RequestKind::BtcPsbt]
+        } else {
+            vec![RequestKind::Hash]
+        };
+        let count = {
+            let mut device = self.device();
+            device.set_request_kinds(kinds);
+            device.accounts().map(|a| a.len()).unwrap_or(0)
+        };
+        // The manager reads a signer's info again when it says its accounts changed.
+        emit_signer_accounts_changed(count as i64);
+        json!({ "ok": true, "whole": enabled }).to_string()
     }
 }
 

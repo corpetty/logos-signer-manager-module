@@ -371,6 +371,36 @@ sections:
         expect_contains:
           - '\"event\":\"accounts_changed\"'
           - '\"available\":false'
+      - title: "A device with a screen is handed the request itself"
+        text: |
+          A device that shows requests on its own screen takes the transaction, message or PSBT
+          itself, never a bare hash, and works out what it signs. The manager hands it the request it
+          read, and checks the answer over its own digest, as for any signer. Here the mock device
+          becomes such a device and is handed a message.
+        run: |
+          ./logos/bin/logoscore call manager_probe heard > /dev/null
+          ./logos/bin/logoscore call mock_device_signer whole true
+          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard | grep -q accounts_changed && break; sleep 0.5; done
+          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"shown on the device"}]}' > wreq.json
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' wreq.json handle > whandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' wreq.json receipt > wreceipt
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat whandle)" > wshown.json
+          ./logos/bin/logoscore call manager_probe approve "$(cat whandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' wshown.json bundle_id)" ""
+          ./logos/bin/logoscore call mock_device_signer screen > wscreen.json
+          cat wscreen.json
+          ./logos/bin/logoscore call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("wscreen.json"))["result"])["waiting"][0]["job"])')" confirm
+          ./logos/bin/logoscore call manager_probe status "$(cat whandle)" "$(cat wreceipt)"
+          ./logos/bin/logoscore call manager_probe fetch "$(cat whandle)" "$(cat wreceipt)"
+          ./logos/bin/logoscore call mock_device_signer whole false
+        code_block: |
+          logoscore call mock_device_signer whole true
+          logoscore call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"shown on the device"}]}'
+          logoscore call mock_device_signer screen                   # "kind":"evm_message"
+          logoscore call mock_device_signer press <job> confirm
+          logoscore call manager_probe fetch <handle> <receipt>
+        expect_contains:
+          - '\"kind\":\"evm_message\"'
+          - '\"reason\":\"approved\"'
+          - '\"signed\":[\"0x'
 
   - title: "Stop"
     step: true

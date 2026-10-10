@@ -12,7 +12,7 @@ use base64::Engine;
 use bdk_wallet::bitcoin::{consensus, Address, Amount, Block, FeeRate, Network, Psbt};
 use bdk_wallet::{KeychainKind, SignOptions, Wallet};
 use logos_signer_interface::mock::{MockOptions, MockSigner};
-use logos_signer_interface::Collects;
+use logos_signer_interface::{Collects, RequestKind};
 use serde_json::{json, Value};
 use signer_manager_module::approval::{Approvals, Approved};
 use signer_manager_module::btc::{AccountPublic, Family};
@@ -241,6 +241,15 @@ fn main() -> Res<()> {
     signers.add("mock_signer", Box::new(MockSigner::new(mock)));
     run(&node, &mut signers, "mock-segwit")?;
     run(&node, &mut signers, "mock-taproot")?;
+
+    // A device with a screen is handed each PSBT whole and works out its sighashes itself. Its own
+    // phrase gives it wallets of its own, with no coins from the rounds above.
+    let mut devices = Registry::new();
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let whole = MockOptions { request_kinds: vec![RequestKind::BtcPsbt], phrase: phrase.into(), ..Default::default() };
+    devices.add("mock_device", Box::new(MockSigner::new(whole)));
+    run(&node, &mut devices, "mock-segwit")?;
+    run(&node, &mut devices, "mock-taproot")?;
     println!("\nall passed");
     Ok(())
 }

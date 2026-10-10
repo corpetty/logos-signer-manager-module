@@ -19,7 +19,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use logos_signer_interface::{verify, HashItem, JobState, Payload, RequestKind, Scheme, Secret, SignRequest, Signature};
+use logos_signer_interface::{verify, HashItem, JobState, Payload, RequestKind, Scheme, Secret, SignRequest, Signature, SignerInfo};
 
 use crate::btc::AccountPublic;
 use crate::error::{bad, ManagerError, Result};
@@ -247,6 +247,8 @@ impl Approvals {
         check_displayable(&intent.purpose, "purpose")?;
 
         let prepared = prepare(signers, &intent)?;
+        // A request its signer can't take is refused here, before anyone is shown it.
+        kind_for(&intent, &prepared, &prepared.found().info)?;
         let bundle_id = commitment(&intent, &prepared)?;
         let (claim_lines, render_lines) = render(&intent, &prepared, &bundle_id)?;
 
@@ -382,13 +384,9 @@ impl Approvals {
             r.last_error = Some(e.message.clone());
             return Err(e.into());
         }
-        if !found.info.request_kinds.contains(&RequestKind::Hash) {
-            return Err(ManagerError::Refused(format!("{} signs whole requests; this manager hands it hashes only", found.name)));
-        }
-        let items = items_for(&r.intent, &prepared)?;
         let request = SignRequest {
             account: found.account.id.clone(),
-            payload: Payload::Hash { items },
+            payload: payload_for(&r.intent, &prepared, &found.info)?,
             secret: (!secret.is_empty()).then(|| Secret::new(secret)),
         };
         let signer = signers.signer(found.signer);
@@ -603,6 +601,55 @@ fn items_for(intent: &Intent, prepared: &Prepared) -> Result<Vec<HashItem>> {
             Ok(HashItem { path: None, scheme: Scheme::Evm, digest: hex::encode(digest) })
         })
         .collect()
+}
+
+/// The kind of request the signer is handed: hashes when it takes them, else the request itself,
+/// one transaction, message or PSBT, for a device to show. Refused when the signer can't take it.
+fn kind_for(intent: &Intent, prepared: &Prepared, info: &SignerInfo) -> Result<RequestKind> {
+    if info.request_kinds.contains(&RequestKind::Hash) {
+        return Ok(RequestKind::Hash);
+    }
+    let refused = |why: String| ManagerError::Refused(format!("{} {why}", prepared.found().name));
+    let kind = match (prepared, intent.legs.as_slice()) {
+        (Prepared::Psbt { .. }, [Leg::Psbt { .. }]) => RequestKind::BtcPsbt,
+        (Prepared::Evm { .. }, [Leg::Tx { .. }]) => RequestKind::EvmTransaction,
+        (Prepared::Evm { .. }, [Leg::Message { .. }]) => RequestKind::EvmMessage,
+        (Prepared::Evm { .. }, [Leg::TypedData { .. }]) => RequestKind::EvmTypedData,
+        (_, [Leg::Digest { .. }]) => return Err(refused("signs what it shows, and a bare digest can't be shown".into())),
+        _ => return Err(refused("signs one transaction, message or PSBT per request".into())),
+    };
+    if !info.request_kinds.contains(&kind) {
+        return Err(refused(format!("doesn't sign {}", kind_words(kind))));
+    }
+    Ok(kind)
+}
+
+/// What the signer is handed, built from the same parsed values the person was shown. Its answer
+/// is checked over the manager's own digests either way.
+fn payload_for(intent: &Intent, prepared: &Prepared, info: &SignerInfo) -> Result<Payload> {
+    Ok(match (kind_for(intent, prepared, info)?, prepared, intent.legs.as_slice()) {
+        (RequestKind::BtcPsbt, Prepared::Psbt { psbt, .. }, [Leg::Psbt { network, .. }]) => {
+            Payload::BtcPsbt { network: network.trim().to_string(), psbt: psbt.to_string() }
+        }
+        (RequestKind::EvmTransaction, _, [Leg::Tx { chain_id, tx }]) => {
+            Payload::EvmTransaction { chain_id: *chain_id, tx: hex::encode(ParsedTx::parse(tx, *chain_id)?.unsigned_bytes()) }
+        }
+        (RequestKind::EvmMessage, _, [Leg::Message { text }]) => Payload::EvmMessage { message: hex::encode(text.as_bytes()) },
+        (RequestKind::EvmTypedData, _, [Leg::TypedData { typed_data }]) => {
+            Payload::EvmTypedData { typed_data: typed_data.clone() }
+        }
+        _ => Payload::Hash { items: items_for(intent, prepared)? },
+    })
+}
+
+fn kind_words(kind: RequestKind) -> &'static str {
+    match kind {
+        RequestKind::Hash => "bare hashes",
+        RequestKind::EvmTransaction => "EVM transactions",
+        RequestKind::EvmMessage => "messages",
+        RequestKind::EvmTypedData => "typed data",
+        RequestKind::BtcPsbt => "PSBTs",
+    }
 }
 
 /// The results from the signer's answer: each signature checked against the account's public
@@ -900,7 +947,7 @@ fn token_hex(seq: u64) -> String {
 mod tests {
     use super::*;
     use logos_signer_interface::mock::{MockOptions, MockSigner};
-    use logos_signer_interface::{Collects, ErrorCode, JobStatus, Signer, SignerInfo};
+    use logos_signer_interface::{Collects, ErrorCode, JobStatus, Signer};
 
     const ACCT0: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
     const PK: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -1252,6 +1299,21 @@ mod tests {
                 ..Default::default()
             }))))
         }
+        /// A device with a screen: it takes whole requests and no bare hash.
+        fn whole() -> Self {
+            Device(std::sync::Arc::new(std::sync::Mutex::new(MockSigner::new(MockOptions {
+                needs_confirmation: true,
+                request_kinds: vec![RequestKind::EvmTransaction, RequestKind::EvmMessage, RequestKind::BtcPsbt],
+                ..Default::default()
+            }))))
+        }
+        /// What the device shows for its only waiting job.
+        fn showing(&self) -> (String, Payload) {
+            let waiting = self.0.lock().unwrap().waiting();
+            assert_eq!(waiting.len(), 1, "one job on the device");
+            let (job, request) = waiting.into_iter().next().unwrap();
+            (job, request.payload)
+        }
         fn press(&self, job: &str, yes: bool) {
             let mut d = self.0.lock().unwrap();
             if yes { d.confirm(job).unwrap() } else { d.refuse(job).unwrap() }
@@ -1359,6 +1421,121 @@ mod tests {
         assert_eq!(ap.drain_moves(), vec![Move::Rendered(h.clone())], "to announce");
         assert!(ap.pending(&mut s).iter().any(|p| p.handle == h && p.error.is_some()), "saying why");
         assert!(ap.fetch_result(&mut s, &h, &r).is_err());
+    }
+
+    fn message_intent(text: &str) -> String {
+        format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"message","text":"{text}"}}]}}"#)
+    }
+
+    /// Request, acknowledge and approve through `s`, then confirm on `device`: what the device was
+    /// handed, and what the requester collects.
+    fn through_device(s: &mut Registry, device: &Device, intent: &str) -> (Payload, Vec<String>) {
+        let mut ap = Approvals::new();
+        let (h, r) = ap.request(s, "x", intent).unwrap();
+        let v = ap.acknowledge(s, &h).unwrap();
+        assert_eq!(ap.approve(s, &h, &v.bundle_id, "", false).unwrap(), Approved::Signing);
+        let (job, payload) = device.showing();
+        device.press(&job, true);
+        assert_eq!(ap.status(s, &h, &r).unwrap(), ("settled", Some("approved")), "{payload:?}");
+        (payload, ap.fetch_result(s, &h, &r).unwrap())
+    }
+
+    #[test]
+    fn a_device_with_a_screen_is_handed_the_transaction_whose_hash_it_signs() {
+        for mode in ["eip1559", "legacy"] {
+            let device = Device::whole();
+            let mut s = Registry::new();
+            s.add("device", Box::new(device.clone()));
+            let intent = tx_intent("0x1").replace(r#""fee_mode":"eip1559""#, &format!(r#""fee_mode":"{mode}","gas_price":"0x2""#));
+            let (payload, signed) = through_device(&mut s, &device, &intent);
+            let Payload::EvmTransaction { chain_id, tx } = payload else { panic!("{payload:?}") };
+            assert_eq!(chain_id, 1);
+            let parsed: Intent = serde_json::from_str(&intent).unwrap();
+            let Leg::Tx { tx: unsigned, .. } = &parsed.legs[0] else { unreachable!() };
+            let want = ParsedTx::parse(unsigned, 1).unwrap().signing_hash();
+            let handed = hex::decode(tx).unwrap();
+            assert_eq!(alloy::primitives::keccak256(&handed), want, "{mode}: keccak-256 of what it was handed");
+            assert_eq!(handed[0] == 0x02, mode == "eip1559", "{mode}: typed or legacy");
+            let raw = hex::decode(signed[0].trim_start_matches("0x")).unwrap();
+            let env = <alloy::consensus::TxEnvelope as alloy::eips::Decodable2718>::decode_2718(&mut raw.as_slice()).unwrap();
+            let (sig, hash) = match &env {
+                alloy::consensus::TxEnvelope::Legacy(t) => (*t.signature(), t.signature_hash()),
+                alloy::consensus::TxEnvelope::Eip1559(t) => (*t.signature(), t.signature_hash()),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(hash, want, "{mode}: the broadcast transaction is the one shown");
+            let by = sig.recover_address_from_prehash(&hash).unwrap();
+            assert_eq!(by.to_string().to_lowercase(), ACCT0.to_lowercase(), "{mode}");
+        }
+    }
+
+    #[test]
+    fn a_device_with_a_screen_is_handed_the_message_itself() {
+        let device = Device::whole();
+        let mut s = Registry::new();
+        s.add("device", Box::new(device.clone()));
+        let (payload, signed) = through_device(&mut s, &device, &message_intent("sign in to example.org"));
+        assert_eq!(payload, Payload::EvmMessage { message: hex::encode("sign in to example.org") });
+        let sig: alloy::primitives::Signature = signed[0].parse().unwrap();
+        let by = sig.recover_address_from_msg("sign in to example.org").unwrap();
+        assert_eq!(by.to_string().to_lowercase(), ACCT0.to_lowercase());
+    }
+
+    #[test]
+    fn a_device_with_a_screen_is_handed_the_psbt_the_manager_read() {
+        for family in [crate::btc::Family::Segwit, crate::btc::Family::Taproot] {
+            let device = Device::whole();
+            let mut s = Registry::new();
+            s.add("device", Box::new(device.clone()));
+            let (_, listed, acct) = crate::psbt::tests::ours(family);
+            let psbt = crate::psbt::tests::sample(&acct);
+            let (payload, signed) = through_device(&mut s, &device, &psbt_intent(&listed.id, &psbt));
+            let Payload::BtcPsbt { network, psbt: handed } = payload else { panic!("{payload:?}") };
+            assert_eq!(network, "regtest");
+            let handed: Psbt = handed.parse().unwrap();
+            assert_eq!(handed.unsigned_tx, psbt.unsigned_tx, "{family:?}");
+            let signed: Psbt = signed[0].parse().unwrap();
+            assert_eq!(signed.unsigned_tx, psbt.unsigned_tx, "{family:?}");
+            for input in &signed.inputs {
+                assert!(!input.partial_sigs.is_empty() || input.tap_key_sig.is_some(), "{family:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_its_device_cant_sign_is_refused_before_anyone_sees_it() {
+        let mut s = Registry::new();
+        s.add("device", Box::new(Device::whole()));
+        let mut ap = Approvals::new();
+        let typed = format!(
+            r#"{{"address":"{ACCT0}","legs":[{{"kind":"typed_data","typed_data":{}}}]}}"#,
+            r#"{"types":{"EIP712Domain":[{"name":"name","type":"string"}],"Note":[{"name":"text","type":"string"}]},"primaryType":"Note","domain":{"name":"t"},"message":{"text":"hi"}}"#
+        );
+        let digest = format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"digest","digest":"0x{}","purpose":"p"}}]}}"#, "11".repeat(32));
+        let two = format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"message","text":"a"}},{{"kind":"message","text":"b"}}]}}"#);
+        for (intent, why) in [(typed, "doesn't sign typed data"), (digest, "a bare digest"), (two, "one transaction, message or PSBT")] {
+            let e = ap.request(&mut s, "x", &intent).unwrap_err();
+            assert!(e.to_string().contains(why), "{e}");
+        }
+        assert!(ap.pending(&mut s).is_empty(), "nothing was offered");
+    }
+
+    #[test]
+    fn the_conformance_suites_transaction_is_alloys_eip1559_encoding() {
+        let tx = alloy::consensus::TxEip1559 {
+            chain_id: 1,
+            nonce: 7,
+            gas_limit: 21_000,
+            max_fee_per_gas: 30_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: alloy::primitives::TxKind::Call([0xdd; 20].into()),
+            value: U256::from(1_000_000_000_000_000u64),
+            input: Default::default(),
+            access_list: Default::default(),
+        };
+        let mut out = Vec::new();
+        alloy::consensus::SignableTransaction::<alloy::primitives::Signature>::encode_for_signing(&tx, &mut out);
+        assert_eq!(out, logos_signer_interface::conformance::eip1559(7));
     }
 
     #[test]
