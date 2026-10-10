@@ -289,11 +289,14 @@ impl SignerManagerModuleImpl {
     }
 
     /// Does an unlock cover this approval's requester for its account?
-    fn cover(&self, handle: &str) -> Cover {
-        match self.approvals.requester_and_account(handle) {
-            Some((requester, account)) => self.access.covers(&account, &requester),
-            None => Cover::No,
+    fn cover(&mut self, handle: &str) -> Cover {
+        let Some((requester, account)) = self.approvals.requester_and_account(handle) else { return Cover::No };
+        if self.access.covers(&account, &requester) == Cover::No {
+            return Cover::No;
         }
+        // The keystore keeps the time and the count: one it has dropped covers nothing here either.
+        let _ = self.access.unlocked(&mut KeystoreKeys);
+        self.access.covers(&account, &requester)
     }
 
     fn named_caller(&self) -> Option<String> {

@@ -171,7 +171,8 @@ module could sign. With an unlock that covers a request:
   `signed_without_asking` announces it and `unattended_signatures` lists it.
 
 A request from a module the unlock doesn't cover still needs the password. A keystore that answers
-`locked` (its time or count ran out) ends the manager's scope too. The manager locks every account
+`locked` (its time or count ran out) ends the manager's scope too, and before it shows a request as
+covered or signs one unseen, the manager checks the keystore still holds that unlock. The manager locks every account
 when it starts, since the terms it kept are gone.
 
 ### Events
