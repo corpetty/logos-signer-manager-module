@@ -196,3 +196,13 @@ nix build                                         # the module
 nix build '.#lgx'                                 # an installable package
 ./doctests/run.sh                                 # the round trip through logoscore
 ```
+
+`tools/regtest` proves the PSBT path against a real node. BDK builds native segwit and taproot sends
+from the descriptors the manager derives. The manager reads them, has the interface's mock signer sign
+them, and checks every signature, and bitcoind has to accept and mine the result. Forged change has to
+show as a send, and a false input amount has to be refused, or for taproot sign nothing that spends:
+
+```sh
+cd tools/regtest
+BITCOIND_EXE=$(nix build nixpkgs#bitcoind --no-link --print-out-paths)/bin/bitcoind cargo run --release
+```

@@ -27,4 +27,7 @@ cd rust-lib && cargo test --no-default-features
 nix build
 ```
 
+[`tools/regtest`](tools/regtest) signs native segwit and taproot sends through the manager and has a
+regtest bitcoind accept them.
+
 Licensed under MIT or Apache-2.0.
