@@ -70,8 +70,10 @@ account, the first holds it. Defaults: approver `evm_signer_ui`, custodian `evm_
 (for the open and unlock requests to come), signers `keystore_module`, `keycard_shell_module` and
 `keycard_module`, so a device module the person installs is consulted with nothing to configure.
 A signer that doesn't answer, such as a device module that isn't installed, offers nothing and
-rests for 30 seconds. Each ask costs the transport about a second to find no module, so a resting
-signer isn't asked again before then, unless a signer announces that its accounts changed.
+rests for 30 seconds. Each ask costs the transport about a second to find no module, and longer on
+a loaded machine, so a resting signer isn't asked again before then, unless it announces itself
+that its accounts changed. Another signer's announcement, which the keystore makes at every
+import, re-reads that signer alone, and so does looking up an account no signer offers.
 
 `configure` is ungated for now, like the keystore's, and the keystore's caveat applies: the
 protection is deferred to module identity in the core. A module that names itself a signer can

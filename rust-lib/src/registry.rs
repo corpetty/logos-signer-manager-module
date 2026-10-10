@@ -55,12 +55,21 @@ impl Registry {
         self.entries.iter().map(|e| e.name.clone()).collect()
     }
 
-    /// Drop every cached listing, and ask a resting signer again: a signer said its accounts changed.
-    pub fn forget(&mut self) {
-        for e in &mut self.entries {
+    /// Drop these signers' listings and ask them again, resting or not: they said their accounts
+    /// changed. Every other signer keeps its listing, and one that is resting keeps resting.
+    pub fn forget(&mut self, names: &[String]) {
+        for e in self.entries.iter_mut().filter(|e| names.contains(&e.name)) {
             e.info = None;
             e.accounts = None;
             e.missed = None;
+        }
+    }
+
+    /// Read every listing again, except from a signer still resting: it was asked moments ago.
+    fn reread(&mut self) {
+        for e in &mut self.entries {
+            e.info = None;
+            e.accounts = None;
         }
     }
 
@@ -97,7 +106,7 @@ impl Registry {
         if let Some(f) = self.lookup(id) {
             return Ok(f);
         }
-        self.forget();
+        self.reread();
         for i in 0..self.entries.len() {
             self.load(i);
         }
@@ -188,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn a_signer_that_does_not_answer_rests_until_a_change_is_announced() {
+    fn a_signer_that_does_not_answer_rests_until_it_announces_a_change_itself() {
         let asks = Arc::new(AtomicUsize::new(0));
         let mut r = Registry::new();
         r.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
@@ -197,9 +206,14 @@ mod tests {
         assert_eq!(r.accounts().len(), 3);
         assert!(r.find("0xF39FD6E51AAD88F6F4CE6AB8827279CFFFB92266").is_ok());
         assert_eq!(asks.load(SeqCst), 1, "asked once, then left alone");
-        r.forget();
+        // The keystore announces at every import; each cost a second per absent module, under the lock.
+        r.forget(&["keystore_module".to_string()]);
         r.accounts();
-        assert_eq!(asks.load(SeqCst), 2, "asked again once a signer announces a change");
+        assert!(r.find("0x0000000000000000000000000000000000000001").is_err());
+        assert_eq!(asks.load(SeqCst), 1, "another signer's news, and an unknown account, leave it resting");
+        r.forget(&["keycard_module".to_string()]);
+        r.accounts();
+        assert_eq!(asks.load(SeqCst), 2, "asked again once it announces a change itself");
     }
 
     #[test]
