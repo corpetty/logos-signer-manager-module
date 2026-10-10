@@ -28,6 +28,6 @@ nix build
 ```
 
 [`tools/regtest`](tools/regtest) signs native segwit and taproot sends through the manager and has a
-regtest bitcoind accept them.
+regtest bitcoind accept them, once over hashes and once by a mock device handed each PSBT whole.
 
 Licensed under MIT or Apache-2.0.

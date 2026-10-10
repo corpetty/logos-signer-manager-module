@@ -180,6 +180,16 @@ impl ParsedTx {
         }
     }
 
+    /// What a device with a screen is handed: the bytes whose keccak-256 is the signing hash.
+    pub fn unsigned_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            ParsedTx::Legacy(t) => t.encode_for_signing(&mut out),
+            ParsedTx::Eip1559(t) => t.encode_for_signing(&mut out),
+        }
+        out
+    }
+
     /// The broadcast-ready EIP-2718 envelope, `0x`-hex.
     pub fn signed_hex(self, sig: Signature) -> String {
         let raw = match self {

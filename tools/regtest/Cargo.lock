@@ -2970,9 +2970,10 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "logos-signer-interface"
 version = "0.1.0"
-source = "git+https://github.com/logos-co/logos-signer-interface?rev=d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02#d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02"
+source = "git+https://github.com/logos-co/logos-signer-interface?rev=0c927c3326ac2774dff68f1a4b1a6dd0503949e0#0c927c3326ac2774dff68f1a4b1a6dd0503949e0"
 dependencies = [
  "bip32",
+ "bitcoin",
  "hex",
  "k256",
  "pbkdf2",

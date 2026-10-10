@@ -1,7 +1,8 @@
 name: Bitcoin regtest
 
 # BDK builds PSBTs from the descriptors the manager derives, the manager reads them and has the
-# interface's mock signer sign, and a regtest bitcoind has to accept the sends (tools/regtest).
+# interface's mock signer sign, over hashes and as a device handed the PSBT whole, and a regtest
+# bitcoind has to accept the sends (tools/regtest).
 # Pinned nixpkgs: Bitcoin Core 31.1, as in keystore_module's harness.
 
 on:

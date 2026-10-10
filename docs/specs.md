@@ -194,6 +194,12 @@ Signer modules are bound at runtime through the `signer` interface dependency
 is also a concrete dependency, so it loads with the manager. A signer that doesn't answer within
 three seconds for `signer_info`, or twenty for anything else, offers nothing until asked again.
 
+A signer that shows requests on its own screen takes them whole, one per request:
+`evm_transaction` (the unsigned bytes whose keccak-256 is the signing hash), `evm_message`,
+`evm_typed_data`, or `btc_psbt` (the manager's own reading of the PSBT). The request is refused before
+anyone is shown it when the signer can't take it: a bare digest, a request of several legs, or a kind
+the signer doesn't list. The answer is checked over the manager's own digests, as a hash signer's is.
+
 A device signer answers `sign` with a job that waits for its person. The approval then reports
 `signing` until the job ends: done, refused on the device (the request settles `rejected`), or
 failed. Every signature that comes back is checked against the account before a result is built.
