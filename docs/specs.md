@@ -183,12 +183,23 @@ to `signing`, and `accounts_changed` (count) after a signer reports its accounts
 and unlocking: `access_requested`, `access_settled`, `unlock_changed` (account) and
 `signed_without_asking` (handle). Handles only: the event plane is unauthenticated.
 
+The manager listens to each signer's `signer_accounts_changed` and `sign_progress`, and announces
+what they change as they come: a device plugged out, or a job its person ended on the device. An app
+that only listens hears it without anyone calling the manager first.
+
 ## The signers
 
 Signer modules are bound at runtime through the `signer` interface dependency
 (`signer.lidl`, from `logos-signer-interface`), one binding per configured name. `keystore_module`
 is also a concrete dependency, so it loads with the manager. A signer that doesn't answer within
 three seconds for `signer_info`, or twenty for anything else, offers nothing until asked again.
+
+A device signer answers `sign` with a job that waits for its person. The approval then reports
+`signing` until the job ends: done, refused on the device (the request settles `rejected`), or
+failed. Every signature that comes back is checked against the account before a result is built.
+An answer that fails the check puts the request back on screen, saying why. The doctest drives this
+with `doctests/mock-device`, a fixture behind the same interface that waits for its button and can
+answer wrong on purpose.
 
 The manager calls its signers from inside its own methods, so it runs with `concurrency: "multi"`:
 each call has a worker thread, and the manager's state sits behind one lock. A call that arrives

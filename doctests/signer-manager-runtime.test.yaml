@@ -51,11 +51,13 @@ sections:
           nix build 'github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1#lgx' --no-write-lock-file -o keystore-lgx
           nix build 'github:logos-co/logos-signer-manager-module{release}#lgx' --no-write-lock-file -o manager-lgx
           nix build 'github:logos-co/logos-signer-manager-module{release}?dir=doctests/manager-probe#lgx' --override-input signer_manager_module 'github:logos-co/logos-signer-manager-module{release}' --override-input keystore_module 'github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1' --no-write-lock-file -o probe-lgx
-          ls keystore-lgx/*.lgx manager-lgx/*.lgx probe-lgx/*.lgx
+          nix build 'github:logos-co/logos-signer-manager-module{release}?dir=doctests/mock-device#lgx' --no-write-lock-file -o device-lgx
+          ls keystore-lgx/*.lgx manager-lgx/*.lgx probe-lgx/*.lgx device-lgx/*.lgx
         code_block: |
           # From inside the clone:
           nix build '.#lgx' -o manager-lgx
           nix build './doctests/manager-probe#lgx' -o probe-lgx
+          nix build './doctests/mock-device#lgx' -o device-lgx      # a signer that behaves like a device
         expect_contains:
           - "manager_probe"
       - title: "Install them"
@@ -66,11 +68,13 @@ sections:
           ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file keystore-lgx/*.lgx
           ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file manager-lgx/*.lgx
           ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file probe-lgx/*.lgx
+          ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file device-lgx/*.lgx
           ./lgpm/bin/lgpm --modules-dir ./modules list
         expect_contains:
           - "keystore_module"
           - "signer_manager_module"
           - "manager_probe"
+          - "mock_device_signer"
 
   - title: "Run the daemon and name the roles"
     step: true
@@ -240,6 +244,137 @@ sections:
           - '\"external\":\"wpkh(['
           - '\"closed\":true'
           - "not authorized"
+
+  - title: "A device signer"
+    step: true
+    text: |
+      `mock_device_signer` is a doc-test fixture behind the same signer interface. It behaves like a
+      device: a job waits until its button is pressed, and it can answer wrong on purpose. Its keys
+      come from another phrase, so its EVM account, `0x9858EfFD232B4033E47d90003D41EC34EcaEda94`, is
+      its own. The manager hands it the prepared request and reports `signing` while the person
+      decides on the device. It then checks every signature that comes back before building the
+      result.
+    steps:
+      - title: "Load the device"
+        run: "./logos/bin/logoscore load-module mock_device_signer"
+        code_block: "logoscore load-module mock_device_signer"
+        expect_contains:
+          - "mock_device_signer"
+      - title: "The manager consults it beside the keystore"
+        run: |
+          ./logos/bin/logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["keystore_module","mock_device_signer"]}'
+          ./logos/bin/logoscore call signer_manager_module accounts
+        code_block: |
+          logoscore call signer_manager_module configure '{…, "signers":["keystore_module","mock_device_signer"]}'
+          logoscore call signer_manager_module accounts
+        expect_contains:
+          - '\"signer\":\"mock_device_signer\"'
+          - "0x9858effd232b4033e47d90003d41ec34ecaeda94"
+      - title: "An approval waits for the device"
+        text: |
+          The device asks the person itself, so the approver sends no secret, and the request stays
+          `signing` with the job on the device's screen.
+        run: |
+          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"hello-device"}]}' > dreq.json
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' dreq.json handle > dhandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' dreq.json receipt > dreceipt
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat dhandle)" > dshown.json
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' dshown.json bundle_id > dbundle
+          cat dshown.json
+          ./logos/bin/logoscore call manager_probe approve "$(cat dhandle)" "$(cat dbundle)" ""
+          ./logos/bin/logoscore call manager_probe status "$(cat dhandle)" "$(cat dreceipt)"
+          ./logos/bin/logoscore call mock_device_signer screen
+        code_block: |
+          logoscore call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"hello-device"}]}'
+          logoscore call manager_probe acknowledge <handle>          # collects: nothing
+          logoscore call manager_probe approve <handle> <bundle_id> ""
+          logoscore call mock_device_signer screen                   # the job, waiting
+        expect_contains:
+          - '\"collects\":\"nothing\"'
+          - '\"signer\":\"mock_device_signer\"'
+          - '\"state\":\"signing\"'
+          - '\"account\":\"0x9858effd232b4033e47d90003d41ec34ecaeda94\"'
+      - title: "The person confirms on the device, and the requester collects"
+        text: |
+          The manager listens to the device, so it announces `approval_settled` when the answer
+          comes. A requester that only listens hears it without asking anyone.
+        run: |
+          ./logos/bin/logoscore call mock_device_signer screen > screen.json
+          python3 -c 'import json; print(json.loads(json.load(open("screen.json"))["result"])["waiting"][0]["job"])' > djob
+          ./logos/bin/logoscore call manager_probe heard > /dev/null
+          ./logos/bin/logoscore call mock_device_signer press "$(cat djob)" confirm
+          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard > heard.json; grep -q "$(cat dhandle)" heard.json && break; sleep 0.5; done
+          cat heard.json
+          ./logos/bin/logoscore call manager_probe status "$(cat dhandle)" "$(cat dreceipt)"
+          ./logos/bin/logoscore call manager_probe fetch "$(cat dhandle)" "$(cat dreceipt)"
+        code_block: |
+          logoscore call mock_device_signer press <job> confirm
+          logoscore call manager_probe heard                         # approval_settled, unasked
+          logoscore call manager_probe status <handle> <receipt>
+          logoscore call manager_probe fetch <handle> <receipt>
+        expect_contains:
+          - '\"event\":\"approval_settled\"'
+          - '\"reason\":\"approved\"'
+          - '\"signed\":[\"0x'
+      - title: "A refusal on the device ends the request"
+        run: |
+          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"declined"}]}' > rreq.json
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' rreq.json handle > rhandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' rreq.json receipt > rreceipt
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat rhandle)" > rshown.json
+          ./logos/bin/logoscore call manager_probe approve "$(cat rhandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' rshown.json bundle_id)" ""
+          ./logos/bin/logoscore call mock_device_signer screen > screen.json
+          ./logos/bin/logoscore call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("screen.json"))["result"])["waiting"][0]["job"])')" refuse
+          ./logos/bin/logoscore call manager_probe status "$(cat rhandle)" "$(cat rreceipt)"
+        code_block: "logoscore call mock_device_signer press <job> refuse"
+        expect_contains:
+          - '\"reason\":\"rejected\"'
+      - title: "A doctored answer is refused, and the request stays on screen"
+        text: |
+          The device answers with a valid signature by a key the account doesn't hold. The manager
+          checks it against the account before building anything. It refuses it, puts the request
+          back on screen saying why, and the requester gets nothing.
+        run: |
+          ./logos/bin/logoscore call mock_device_signer doctor other_key
+          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a device","legs":[{"kind":"message","text":"doctored"}]}' > xreq.json
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' xreq.json handle > xhandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' xreq.json receipt > xreceipt
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat xhandle)" > xshown.json
+          ./logos/bin/logoscore call manager_probe approve "$(cat xhandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' xshown.json bundle_id)" ""
+          ./logos/bin/logoscore call mock_device_signer screen > screen.json
+          ./logos/bin/logoscore call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("screen.json"))["result"])["waiting"][0]["job"])')" confirm
+          ./logos/bin/logoscore call manager_probe status "$(cat xhandle)" "$(cat xreceipt)"
+          ./logos/bin/logoscore call manager_probe pending
+          ./logos/bin/logoscore call manager_probe reject "$(cat xhandle)"
+          ./logos/bin/logoscore call mock_device_signer doctor none
+        code_block: |
+          logoscore call mock_device_signer doctor other_key
+          logoscore call mock_device_signer press <job> confirm
+          logoscore call manager_probe status <handle> <receipt>     # rendered again
+          logoscore call manager_probe pending                       # with the reason
+        expect_contains:
+          - '\"state\":\"rendered\"'
+          - "recovers to"
+      - title: "Unplugged, its accounts stay listed, and listeners hear at once"
+        text: |
+          A device that goes away keeps its accounts in the list, marked unavailable. The manager
+          announces `accounts_changed` as soon as the device reports it, so an app that only
+          listens, such as the keys app, shows it at once.
+        run: |
+          ./logos/bin/logoscore call manager_probe heard > /dev/null
+          ./logos/bin/logoscore call mock_device_signer plug false
+          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard > heard.json; grep -q accounts_changed heard.json && break; sleep 0.5; done
+          cat heard.json
+          ./logos/bin/logoscore call signer_manager_module accounts
+          ./logos/bin/logoscore call mock_device_signer plug true
+        code_block: |
+          logoscore call mock_device_signer plug false
+          logoscore call manager_probe heard                         # accounts_changed, unasked
+          logoscore call signer_manager_module accounts              # the device's: "available":false
+        expect_contains:
+          - '\"event\":\"accounts_changed\"'
+          - '\"available\":false'
+
+  - title: "Stop"
+    step: true
+    steps:
       - title: "Stop the daemon"
         run: "./logos/bin/logoscore stop"
         code_block: "logoscore stop"

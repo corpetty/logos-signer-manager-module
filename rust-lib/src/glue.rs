@@ -6,7 +6,7 @@
 //! shapes, so a requester or an approver changes only the module it calls.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use serde_json::json;
@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use logos_signer_interface::{json as signer_json, Account, ErrorCode, JobStatus, SignRequest, Signature, Signer, SignerError, SignerInfo};
 
 use crate::access::{Access, Cover, Decision, KeyHolder, Terms, Unlocked};
-use crate::approval::{Approvals, Approved};
+use crate::approval::{Approvals, Approved, Move};
 use crate::gate;
 use crate::registry::Registry;
 use crate::ManagerError;
@@ -243,9 +243,15 @@ struct Unattended {
 
 /// The module: one lock around its state. Concurrency is "multi", so each call runs on a worker
 /// thread and waits there for the lock, never nested on the main thread an outbound call needs.
-#[derive(Default)]
 struct SignerManagerModuleImpl {
-    core: std::sync::Mutex<Core>,
+    core: Arc<std::sync::Mutex<Core>>,
+}
+
+impl Default for SignerManagerModuleImpl {
+    fn default() -> Self {
+        let core = Arc::new_cyclic(|me| std::sync::Mutex::new(Core { me: me.clone(), ..Default::default() }));
+        SignerManagerModuleImpl { core }
+    }
 }
 
 impl SignerManagerModuleImpl {
@@ -264,6 +270,15 @@ struct Core {
     /// Set by a listener when any signer's accounts change.
     stale: Arc<AtomicBool>,
     started: bool,
+    /// This core, for the listeners: a signer's news is announced when it comes, not at the next call.
+    me: Weak<std::sync::Mutex<Core>>,
+}
+
+/// From a listener thread: re-read and announce what a signer's event changed.
+fn nudge(me: &Weak<std::sync::Mutex<Core>>) {
+    if let Some(core) = me.upgrade() {
+        core.lock().unwrap_or_else(|e| e.into_inner()).refresh();
+    }
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -317,16 +332,27 @@ impl Core {
         Self::caller().named().map(str::to_string)
     }
 
-    /// The configured signer modules, bound by name, each listened to for account changes.
+    /// The configured signer modules, bound by name, each listened to for account changes and
+    /// for its jobs' progress.
     fn bind_signers(&mut self) {
         let mut r = Registry::new();
         for name in &self.roles.signers {
             r.add(name.clone(), Box::new(IpcSigner { name: name.clone() }));
-            let stale = self.stale.clone();
-            if let Ok(sub) = signer::SignerClient::bind(name).on_signer_accounts_changed() {
+            let mut client = signer::SignerClient::bind(name);
+            if let Ok(sub) = client.on_signer_accounts_changed() {
+                let (stale, me) = (self.stale.clone(), self.me.clone());
                 std::thread::spawn(move || {
                     for _ in sub {
                         stale.store(true, Ordering::SeqCst);
+                        nudge(&me);
+                    }
+                });
+            }
+            if let Ok(sub) = client.on_sign_progress() {
+                let me = self.me.clone();
+                std::thread::spawn(move || {
+                    for _ in sub {
+                        nudge(&me);
                     }
                 });
             }
@@ -343,6 +369,14 @@ impl Core {
         if self.stale.swap(false, Ordering::SeqCst) {
             self.signers.forget();
             emit_accounts_changed(self.signers.accounts().len() as i64);
+        }
+        // A device ends its job in its own time: look, and announce what that moved.
+        self.approvals.progress(&mut self.signers);
+        for m in self.approvals.drain_moves() {
+            match m {
+                Move::Settled(h, o) => emit_approval_settled(&h, o.as_str()),
+                Move::Rendered(h) => emit_approval_progress(&h, "rendered"),
+            }
         }
     }
 }

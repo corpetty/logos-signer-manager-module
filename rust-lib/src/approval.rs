@@ -136,6 +136,16 @@ pub struct Approvals {
     records: Vec<Record>,
     seq: u64,
     abandoned_offer_ttl: Option<Duration>,
+    moves: Vec<Move>,
+}
+
+/// What a signer's answer moved since the glue last asked: a device ends its job in its own time,
+/// and the glue announces it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Move {
+    Settled(String, Outcome),
+    /// Back on screen, saying why.
+    Rendered(String),
 }
 
 /// What `acknowledge` hands an approver, in two groups it must not merge.
@@ -435,24 +445,33 @@ impl Approvals {
                 JobState::Working | JobState::ConfirmOnDevice => Ok(None),
             }
         })();
-        match outcome {
+        let moved = match outcome {
             Ok(Some(out)) => {
                 r.results = Some(out);
                 r.state = State::Settled(Outcome::Approved);
                 r.job = None;
+                Move::Settled(handle.to_string(), Outcome::Approved)
             }
-            Ok(None) => {}
+            Ok(None) => return,
             Err(ManagerError::Refused(_)) => {
                 r.state = State::Settled(Outcome::Rejected);
                 r.job = None;
+                Move::Settled(handle.to_string(), Outcome::Rejected)
             }
             Err(e) => {
                 // Back on screen, saying why, so the person can try again.
                 r.last_error = Some(e.to_string());
                 r.state = State::Rendered;
                 r.job = None;
+                Move::Rendered(handle.to_string())
             }
-        }
+        };
+        self.moves.push(moved);
+    }
+
+    /// What moved since the last call, for the glue to announce.
+    pub fn drain_moves(&mut self) -> Vec<Move> {
+        std::mem::take(&mut self.moves)
     }
 
     pub fn reject(&mut self, signers: &mut Registry, handle: &str) -> Result<()> {
@@ -1273,8 +1292,11 @@ mod tests {
         assert!(ap.acknowledge(&mut s, &h).is_err(), "nothing else can be approved over it");
         let job = ap.find(&h).unwrap().job.clone().unwrap();
         // The person confirms on the device; the next look settles the record.
+        assert!(ap.drain_moves().is_empty(), "approving moved nothing yet");
         device.press(&job, true);
         assert_eq!(ap.status(&mut s, &h, &r).unwrap(), ("settled", Some("approved")));
+        assert_eq!(ap.drain_moves(), vec![Move::Settled(h.clone(), Outcome::Approved)], "to announce");
+        assert!(ap.drain_moves().is_empty(), "announced once");
         assert_eq!(ap.fetch_result(&mut s, &h, &r).unwrap().len(), 1);
     }
 
@@ -1290,6 +1312,53 @@ mod tests {
         let job = ap.find(&h).unwrap().job.clone().unwrap();
         device.press(&job, false);
         assert_eq!(ap.status(&mut s, &h, &r).unwrap(), ("settled", Some("rejected")));
+        assert_eq!(ap.drain_moves(), vec![Move::Settled(h, Outcome::Rejected)]);
+    }
+
+    /// A device that signs something else, once the person confirms.
+    struct LyingDevice(Device);
+
+    impl Signer for LyingDevice {
+        fn info(&self) -> SignerInfo {
+            self.0.info()
+        }
+        fn accounts(&mut self) -> logos_signer_interface::Result<Vec<logos_signer_interface::Account>> {
+            self.0.accounts()
+        }
+        fn sign(&mut self, mut request: SignRequest) -> logos_signer_interface::Result<String> {
+            if let Payload::Hash { items } = &mut request.payload {
+                for item in items {
+                    item.digest = "11".repeat(32);
+                }
+            }
+            self.0.sign(request)
+        }
+        fn status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+            self.0.status(job)
+        }
+        fn result(&mut self, job: &str) -> logos_signer_interface::Result<Vec<Signature>> {
+            self.0.result(job)
+        }
+        fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+            self.0.cancel(job)
+        }
+    }
+
+    #[test]
+    fn a_device_that_signs_something_else_puts_the_request_back_and_says_so() {
+        let device = Device::new();
+        let mut s = Registry::new();
+        s.add("device", Box::new(LyingDevice(device.clone())));
+        let mut ap = Approvals::new();
+        let (h, r) = ap.request(&mut s, "x", &tx_intent("0x1")).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        assert_eq!(ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap(), Approved::Signing);
+        let job = ap.find(&h).unwrap().job.clone().unwrap();
+        device.press(&job, true);
+        assert_eq!(ap.status(&mut s, &h, &r).unwrap().0, "rendered", "back on screen");
+        assert_eq!(ap.drain_moves(), vec![Move::Rendered(h.clone())], "to announce");
+        assert!(ap.pending(&mut s).iter().any(|p| p.handle == h && p.error.is_some()), "saying why");
+        assert!(ap.fetch_result(&mut s, &h, &r).is_err());
     }
 
     #[test]
