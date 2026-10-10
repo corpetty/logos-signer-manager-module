@@ -67,10 +67,15 @@ is never a named module.
 keystore's: a role or list the document doesn't name is held by nobody, and a malformed document
 changes nothing. `signers` lists the signer modules consulted, in order; when two offer the same
 account, the first holds it. Defaults: approver `evm_signer_ui`, custodian `evm_keystore_ui`
-(for the open and unlock requests to come), signers `keystore_module`. It is ungated for now, like
-the keystore's, and the keystore's caveat applies: the protection is deferred to module identity
-in the core. A module that names itself a signer can refuse or stall a request, but it can't get a
-false signature past the checks above.
+(for the open and unlock requests to come), signers `keystore_module`, `keycard_shell_module` and
+`keycard_module`, so a device module the person installs is consulted with nothing to configure.
+A signer that doesn't answer, such as a device module that isn't installed, offers nothing and
+rests for 30 seconds. Each ask costs the transport about a second to find no module, so a resting
+signer isn't asked again before then, unless a signer announces that its accounts changed.
+
+`configure` is ungated for now, like the keystore's, and the keystore's caveat applies: the
+protection is deferred to module identity in the core. A module that names itself a signer can
+refuse or stall a request, but it can't get a false signature past the checks above.
 
 ## API
 

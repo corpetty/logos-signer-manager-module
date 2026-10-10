@@ -1,15 +1,23 @@
 //! The signers the manager consults, in order, and the accounts they offer. A signer is anything
 //! behind `logos.signer/1`: a module over IPC in production, a mock or a test double in tests.
 
+use std::time::{Duration, Instant};
+
 use logos_signer_interface::{Account, Family, Signer, SignerInfo};
 
 use crate::error::{ManagerError, Result};
+
+/// How long a signer that didn't answer is left alone. A module that isn't installed, such as a
+/// default device module, costs the transport's wait of about a second at each ask.
+const RESTING: Duration = Duration::from_secs(30);
 
 struct Entry {
     name: String,
     signer: Box<dyn Signer + Send>,
     info: Option<SignerInfo>,
     accounts: Option<Vec<Account>>,
+    /// When it last didn't answer.
+    missed: Option<Instant>,
 }
 
 /// An account and the signer that holds it.
@@ -40,26 +48,31 @@ impl Registry {
 
     /// Signers are consulted in the order added: when two offer the same account, the first holds it.
     pub fn add(&mut self, name: impl Into<String>, signer: Box<dyn Signer + Send>) {
-        self.entries.push(Entry { name: name.into(), signer, info: None, accounts: None });
+        self.entries.push(Entry { name: name.into(), signer, info: None, accounts: None, missed: None });
     }
 
     pub fn names(&self) -> Vec<String> {
         self.entries.iter().map(|e| e.name.clone()).collect()
     }
 
-    /// Drop every cached listing: a signer said its accounts changed.
+    /// Drop every cached listing, and ask a resting signer again: a signer said its accounts changed.
     pub fn forget(&mut self) {
         for e in &mut self.entries {
             e.info = None;
             e.accounts = None;
+            e.missed = None;
         }
     }
 
-    /// Read a signer's info and accounts once. A signer that doesn't answer offers nothing until asked again.
+    /// Read a signer's info and accounts once. One that doesn't answer offers nothing, and rests.
     fn load(&mut self, i: usize) {
         let e = &mut self.entries[i];
         if e.info.is_none() {
+            if e.missed.is_some_and(|t| t.elapsed() < RESTING) {
+                return;
+            }
             e.info = e.signer.info_checked();
+            e.missed = e.info.is_none().then(Instant::now);
         }
         if e.accounts.is_none() && e.info.is_some() {
             e.accounts = e.signer.accounts().ok();
@@ -137,6 +150,57 @@ impl<S: Signer + ?Sized> InfoChecked for S {
 mod tests {
     use super::*;
     use logos_signer_interface::mock::{MockOptions, MockSigner};
+    use logos_signer_interface::{Collects, JobStatus, SignRequest, Signature};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    /// A module that isn't installed: it never answers, and counts the asks.
+    struct Absent(Arc<AtomicUsize>);
+
+    impl Signer for Absent {
+        fn info(&self) -> SignerInfo {
+            self.0.fetch_add(1, SeqCst);
+            SignerInfo {
+                interface: String::new(),
+                kind: String::new(),
+                model: String::new(),
+                families: Vec::new(),
+                request_kinds: Vec::new(),
+                shows_request: false,
+                collects: Collects::Nothing,
+            }
+        }
+        fn accounts(&mut self) -> logos_signer_interface::Result<Vec<Account>> {
+            unreachable!("asked only after it answers")
+        }
+        fn sign(&mut self, _: SignRequest) -> logos_signer_interface::Result<String> {
+            unreachable!()
+        }
+        fn status(&mut self, _: &str) -> logos_signer_interface::Result<JobStatus> {
+            unreachable!()
+        }
+        fn result(&mut self, _: &str) -> logos_signer_interface::Result<Vec<Signature>> {
+            unreachable!()
+        }
+        fn cancel(&mut self, _: &str) -> logos_signer_interface::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_signer_that_does_not_answer_rests_until_a_change_is_announced() {
+        let asks = Arc::new(AtomicUsize::new(0));
+        let mut r = Registry::new();
+        r.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
+        r.add("keycard_module", Box::new(Absent(asks.clone())));
+        assert_eq!(r.accounts().len(), 3);
+        assert_eq!(r.accounts().len(), 3);
+        assert!(r.find("0xF39FD6E51AAD88F6F4CE6AB8827279CFFFB92266").is_ok());
+        assert_eq!(asks.load(SeqCst), 1, "asked once, then left alone");
+        r.forget();
+        r.accounts();
+        assert_eq!(asks.load(SeqCst), 2, "asked again once a signer announces a change");
+    }
 
     #[test]
     fn an_account_is_found_under_the_first_signer_that_offers_it() {

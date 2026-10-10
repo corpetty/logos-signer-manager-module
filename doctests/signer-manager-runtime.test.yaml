@@ -89,6 +89,16 @@ sections:
         expect_contains:
           - "signer_manager_module"
           - "keystore_module"
+      - title: "Unconfigured, the keystore and the Keycard modules"
+        text: |
+          With nothing configured, the manager consults the keystore, then the Keycard Shell's and the
+          bare Keycard's modules. Neither device module is installed here, so each offers nothing.
+        run: "./logos/bin/logoscore call signer_manager_module signers"
+        code_block: "logoscore call signer_manager_module signers"
+        expect_contains:
+          - '\"kind\":\"keystore\"'
+          - '\"info\":null,\"name\":\"keycard_shell_module\"'
+          - '\"info\":null,\"name\":\"keycard_module\"'
       - title: "Name the roles"
         text: |
           The keystore's custodian administers its key files, and only its manager may ask it to sign.
