@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use logos_signer_interface::{json as signer_json, Account, ErrorCode, JobStatus, SignRequest, Signature, Signer, SignerError, SignerInfo};
 
 use crate::access::{Access, Cover, Decision, KeyHolder, Terms, Unlocked};
-use crate::approval::{Approvals, Approved};
+use crate::approval::{Approvals, Approved, Move};
 use crate::gate;
 use crate::registry::Registry;
 use crate::ManagerError;
@@ -343,6 +343,14 @@ impl Core {
         if self.stale.swap(false, Ordering::SeqCst) {
             self.signers.forget();
             emit_accounts_changed(self.signers.accounts().len() as i64);
+        }
+        // A device ends its job in its own time: look, and announce what that moved.
+        self.approvals.progress(&mut self.signers);
+        for m in self.approvals.drain_moves() {
+            match m {
+                Move::Settled(h, o) => emit_approval_settled(&h, o.as_str()),
+                Move::Rendered(h) => emit_approval_progress(&h, "rendered"),
+            }
         }
     }
 }
