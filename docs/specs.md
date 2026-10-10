@@ -52,6 +52,10 @@ stays in `signing`, and each later call checks how the job stands:
 | A | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | B | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; all but the first also need the receipt |
 | C | `accounts`, `signers`, `caller_identity`, and for now `configure` | anyone |
+| B | `request_open`, `request_unlock` | any **named module**, collecting with `fetch_result` and its receipt |
+| D | `access_requests`, `acknowledge_access`, `approve_access`, `reject_access`, `open_accounts`, `unlock`, `lock` | a configured **custodian** (default `evm_keystore_ui`, the keys app) |
+| — | `account_descriptors`, and `close_account` for one's own wallet | a module the wallet is open for |
+| A and D | `unlocked`, `unattended_signatures` | the approver or the custodian |
 
 Refusals are the identical `{"ok":false,"error":"not authorized"}`. The host anchor (the CLI)
 is never a named module.
@@ -84,6 +88,18 @@ false signature past the checks above.
 | `accounts` | — | `{ ok, accounts: [{ id, family, chain?, address?, label?, signer, available }] }` |
 | `signers` | — | `{ ok, signers: [{ name, info? }] }` |
 | `caller_identity` | — | `{ ok, kind, identity, approvers, custodians }` |
+| `request_open`, `request_unlock` | `params_json` | `{ ok, handle, receipt, state }` |
+| `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }` |
+| `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines }` |
+| `approve_access` | `params_json` | `{ ok }`, or `{ ok: false, code, error }` |
+| `reject_access` | `handle` | `bool` |
+| `account_descriptors` | `group` | `{ ok, group, external, internal }` |
+| `close_account` | `params_json` | `{ ok, closed }` |
+| `open_accounts` | — | `{ ok, open: [{ module, group }] }` |
+| `unlock` | `params_json` | `{ ok, account, expiresInMs, countLeft }` |
+| `lock` | `params_json` | `{ ok, locked }` |
+| `unlocked` | — | `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm }] }` |
+| `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, ageMs }] }` |
 
 `approve`'s `code` is the signer's: `wrong_secret` (ask again), `locked` (no password and no
 unlock), `unavailable` (the signer module didn't answer). `accounts` carries no xpub: a Bitcoin
@@ -117,11 +133,50 @@ The manager computes each input's sighash and hands the sighashes to the signer 
 input's path. It adds a signature to the PSBT only after the signature verifies. One signature
 missing, or one that fails, adds none.
 
+## Opening and unlocking
+
+A Bitcoin wallet's descriptors and database key reach a module only once a person opens the
+wallet for it in the keys app, and an account stays unlocked only on terms a person chose.
+
+- `request_open` takes `{ group }` to reopen a wallet, or `{ family, network }` to let the person
+  pick, create or restore one, with optional `unlock` terms and a `reason`. It answers `{ ok,
+  handle, receipt, state }`. Once the custodian approves, `fetch_result` with the receipt returns
+  `{ group, family, chain, external, internal, fingerprint, databaseKey, unlocked }`, and the
+  wallet is **open** for that module: `account_descriptors` (`{ group }` → `{ ok, group, external,
+  internal }`) answers it again, and nobody else. `close_account` (`{ group }`) ends that; an unlock
+  scoped to the module alone ends with it.
+- `request_unlock` takes `{ account, ttlMs?, count?, apps?, confirm?, reason? }`, the terms an app
+  asks for. `fetch_result` returns the terms the person granted, which may differ.
+- The custodian (the keys app) works the queue with `access_requests`, `acknowledge_access` (the
+  lines to show and the commitment to echo), `approve_access` (`{ handle, bundle_id, group?,
+  password, unlock? }`) and `reject_access`. A wrong password answers `code: wrong_secret` and
+  leaves the request on screen. The database key comes from the keystore's `database_key`, the
+  unlock from its `unlock`; the manager keeps neither.
+- The keys app also unlocks and locks on its own: `unlock` (`{ account, password, ttlMs?,
+  count?, apps, confirm? }`) and `lock` (`{ account? }`, everything for `{}`). `unlocked` lists
+  every unlock with its apps and confirmation, and `open_accounts` every open wallet.
+
+### Terms
+
+The keystore holds an unlocked key and enforces its **time** and **count**; the manager enforces
+which **apps** it covers and whether each signature is still **confirmed**. An empty `apps` means
+the module that asked. `"*"` covers any app, and only with confirmation, because without it every
+module could sign. With an unlock that covers a request:
+
+- **confirmed**: the approver approves with no password, and the keystore signs inside the unlock;
+- **without asking**: the request is signed as it arrives, unseen, and settles at once;
+  `signed_without_asking` announces it and `unattended_signatures` lists it.
+
+A request from a module the unlock doesn't cover still needs the password. A keystore that answers
+`locked` (its time or count ran out) ends the manager's scope too. The manager locks every account
+when it starts, since the terms it kept are gone.
+
 ### Events
 
-`approval_offered(handle)`, `approval_settled(handle, state)`, `approval_progress(handle, state)`
-when a request moves to `signing`, and `accounts_changed(count)` after a signer reports its
-accounts changed. Handles only: the event plane is unauthenticated.
+`approval_offered` and `approval_settled` (handle, state), `approval_progress` when a request moves
+to `signing`, and `accounts_changed` (count) after a signer reports its accounts changed. For opening
+and unlocking: `access_requested`, `access_settled`, `unlock_changed` (account) and
+`signed_without_asking` (handle). Handles only: the event plane is unauthenticated.
 
 ## The signers
 

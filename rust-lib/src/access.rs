@@ -1,0 +1,731 @@
+//! Opening and unlocking accounts: requests a person decides in the keys app (the custodian), the
+//! grants they leave, and the scope of each unlock.
+//!
+//! An open request connects one Bitcoin wallet to one module for this session: once a person
+//! approves it, the module collects the wallet's descriptors and its database key with its receipt,
+//! and may read the descriptors again until it closes the wallet. An unlock request asks for an
+//! account's key to stay unlocked on terms; the person decides the terms. The keystore holds the key
+//! and enforces the time and the count; this module enforces which apps an unlock covers and
+//! whether each signature is still confirmed. Nothing here is written down.
+
+use std::time::{Duration, Instant};
+
+use rand::RngCore;
+use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
+use zeroize::Zeroizing;
+
+use logos_signer_interface::Family;
+
+use crate::btc::AccountPublic;
+use crate::error::{bad, ManagerError, Result};
+use crate::evm::check_displayable;
+use crate::registry::Registry;
+
+pub const MAX_PENDING_PER_REQUESTER: usize = 2;
+pub const SETTLED_RETENTION: Duration = Duration::from_secs(120);
+pub const ABANDONED_OFFER_TTL: Duration = Duration::from_secs(300);
+
+/// What the keystore does for an open or an unlock, beyond the signer interface.
+pub trait KeyHolder {
+    fn database_key(&mut self, group: &str, password: Option<&str>) -> Result<Zeroizing<String>>;
+    fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> Result<Unlocked>;
+    fn lock(&mut self, account: Option<&str>) -> Result<usize>;
+    fn unlocked(&mut self) -> Result<Vec<Unlocked>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unlocked {
+    pub account: String,
+    #[serde(default)]
+    pub expires_in_ms: Option<u64>,
+    #[serde(default)]
+    pub count_left: Option<u32>,
+}
+
+/// An unlock's terms. `apps` empty means the module that asked; `confirm` false means its requests
+/// are signed without being shown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Terms {
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    #[serde(default)]
+    pub count: Option<u32>,
+    #[serde(default)]
+    pub apps: Vec<String>,
+    /// Each signature is still confirmed in the signer. True unless the person chooses otherwise.
+    #[serde(default = "yes")]
+    pub confirm: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Terms {
+    fn describe(&self, requester: &str) -> String {
+        let time = self.ttl_ms.map_or("until locked".to_string(), |ms| format!("for {}", duration(ms)));
+        let count = self.count.map_or(String::new(), |n| format!(", up to {n} signature request(s)"));
+        let apps = if self.apps.is_empty() { requester.to_string() } else { self.apps.join(", ") };
+        let how = if self.confirm { "each one confirmed in the signer" } else { "WITHOUT showing them to you" };
+        format!("{time}{count}, for {apps}, {how}")
+    }
+
+    /// "Any app" is offered only with confirmation: without it every module could sign.
+    fn check(&self) -> Result<()> {
+        if !self.confirm && self.apps.iter().any(|a| a == "*") {
+            return Err(bad("unlock: signing without asking must name the apps it covers"));
+        }
+        for a in &self.apps {
+            check_displayable(a, "app")?;
+        }
+        if self.count == Some(0) || self.ttl_ms == Some(0) {
+            return Err(bad("unlock: terms that allow nothing"));
+        }
+        Ok(())
+    }
+}
+
+fn duration(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..=119 => format!("{s} seconds"),
+        120..=7199 => format!("{} minutes", s / 60),
+        _ => format!("{} hours", s / 3600),
+    }
+}
+
+/// How an unlock covers a request from one module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cover {
+    No,
+    /// Approved with a confirmation, no password.
+    Confirmed,
+    /// Signed as it arrives, unseen.
+    WithoutAsking,
+}
+
+/// What the manager keeps of an unlock: whose it is and which apps it covers. The key and the time
+/// and count are the keystore's.
+#[derive(Debug, Clone)]
+struct Scope {
+    account: String,
+    apps: Vec<String>,
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OpenParams {
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub family: Option<Family>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub unlock: Option<Terms>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// `{ account, ttlMs?, count?, apps?, confirm?, reason? }`: an account and the terms asked for.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnlockParams {
+    pub account: String,
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    #[serde(default)]
+    pub count: Option<u32>,
+    #[serde(default)]
+    pub apps: Vec<String>,
+    #[serde(default = "yes")]
+    pub confirm: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl UnlockParams {
+    pub fn terms(&self) -> Terms {
+        Terms { ttl_ms: self.ttl_ms, count: self.count, apps: self.apps.clone(), confirm: self.confirm }
+    }
+}
+
+#[derive(Debug)]
+enum Kind {
+    Open(OpenParams),
+    Unlock(UnlockParams),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Offered,
+    Rendered,
+    Settled(&'static str),
+}
+
+struct Record {
+    handle: String,
+    receipt_hash: [u8; 32],
+    requester: String,
+    kind: Kind,
+    bundle_id: [u8; 32],
+    lines: Vec<String>,
+    state: State,
+    offered_at: Instant,
+    settled_at: Option<Instant>,
+    result: Option<serde_json::Value>,
+}
+
+/// What the custodian decided: the wallet picked, its password, and the terms it granted.
+#[derive(Debug)]
+pub struct Decision {
+    pub group: Option<String>,
+    pub password: String,
+    pub unlock: Option<Terms>,
+}
+
+pub struct Shown {
+    pub handle: String,
+    pub requester: String,
+    pub kind: &'static str,
+    pub bundle_id: String,
+    pub lines: Vec<String>,
+}
+
+pub struct Summary {
+    pub handle: String,
+    pub requester: String,
+    pub kind: &'static str,
+    pub state: &'static str,
+    pub age_ms: u128,
+}
+
+#[derive(Default)]
+pub struct Access {
+    records: Vec<Record>,
+    /// (module, group): a wallet open for a module.
+    grants: Vec<(String, String)>,
+    scopes: Vec<Scope>,
+    seq: u64,
+}
+
+fn sha256(b: &[u8]) -> [u8; 32] {
+    Sha256::digest(b).into()
+}
+
+fn token(seq: u64) -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    format!("{}{:x}", hex::encode(b), seq)
+}
+
+fn lower(id: &str) -> String {
+    id.trim().to_ascii_lowercase()
+}
+
+impl Access {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn sweep(&mut self) {
+        let now = Instant::now();
+        for r in &mut self.records {
+            if r.state == State::Offered && now.duration_since(r.offered_at) > ABANDONED_OFFER_TTL {
+                r.state = State::Settled("expired_no_ack");
+            }
+            if matches!(r.state, State::Settled(_)) && r.settled_at.is_none() {
+                r.settled_at = Some(now);
+            }
+        }
+        self.records.retain(|r| {
+            let Some(at) = r.settled_at else { return true };
+            r.result.is_some() || now.duration_since(at) < SETTLED_RETENTION
+        });
+    }
+
+    pub fn owns(&self, handle: &str) -> bool {
+        self.records.iter().any(|r| r.handle == handle)
+    }
+
+    fn by_receipt(&mut self, handle: &str, receipt: &str) -> Result<&mut Record> {
+        let want = sha256(receipt.as_bytes());
+        self.records
+            .iter_mut()
+            .find(|r| r.handle == handle && r.receipt_hash == want)
+            .ok_or_else(|| ManagerError::NotFound(handle.to_string()))
+    }
+
+    fn admit(&mut self, requester: &str) -> Result<()> {
+        self.sweep();
+        let live = self.records.iter().filter(|r| !matches!(r.state, State::Settled(_)) && r.requester == requester).count();
+        if live >= MAX_PENDING_PER_REQUESTER {
+            return Err(bad("too many pending open or unlock requests for this requester"));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, requester: &str, kind: Kind, lines: Vec<String>) -> (String, String) {
+        self.seq += 1;
+        let handle = format!("sma_{}", token(self.seq));
+        let receipt = format!("smr_{}", token(self.seq));
+        let mut h = Sha256::new();
+        h.update(b"logos-signer-manager-access-v1\n");
+        h.update(requester.as_bytes());
+        for l in &lines {
+            h.update(b"\n");
+            h.update(l.as_bytes());
+        }
+        self.records.push(Record {
+            handle: handle.clone(),
+            receipt_hash: sha256(receipt.as_bytes()),
+            requester: requester.to_string(),
+            kind,
+            bundle_id: h.finalize().into(),
+            lines,
+            state: State::Offered,
+            offered_at: Instant::now(),
+            settled_at: None,
+            result: None,
+        });
+        (handle, receipt)
+    }
+
+    /// A module asks for a Bitcoin wallet: one it names, or any of a family and network the person
+    /// picks, creates or restores in the keys app.
+    pub fn request_open(&mut self, signers: &mut Registry, requester: &str, params_json: &str) -> Result<(String, String)> {
+        self.admit(requester)?;
+        let p: OpenParams = serde_json::from_str(params_json).map_err(|e| bad(format!("open: {e}")))?;
+        check_displayable(&p.reason, "reason")?;
+        if let Some(t) = &p.unlock {
+            t.check()?;
+        }
+        let mut lines = vec![format!("{requester} asks to open a Bitcoin wallet")];
+        match (&p.group, &p.family, &p.network) {
+            (Some(g), None, None) => {
+                let found = signers.find(g)?;
+                let acct = AccountPublic::from_account(&found.account)?;
+                let name = found.account.label.clone().unwrap_or_else(|| found.account.id.clone());
+                lines.push(format!("Wallet: {name} ({}, {} chain)", acct.family.describe(), acct.chain.as_str()));
+            }
+            (None, Some(f), Some(n)) if f.is_bitcoin() => {
+                let family = if *f == Family::Bitcoin { "native segwit" } else { "taproot" };
+                check_displayable(n, "network")?;
+                lines.push(format!("Any {family} wallet on {n}: pick one, create one or restore one"));
+            }
+            _ => return Err(bad("open: name a Bitcoin group, or a Bitcoin family and a network")),
+        }
+        lines.push("It will see every address and transaction of that wallet, and can ask you to sign.".into());
+        if let Some(t) = &p.unlock {
+            lines.push(format!("It also asks to unlock it: {}", t.describe(requester)));
+        }
+        if !p.reason.trim().is_empty() {
+            lines.push(format!("Reason (claimed by the requester): {}", p.reason.trim()));
+        }
+        Ok(self.push(requester, Kind::Open(p), lines))
+    }
+
+    /// A module asks for an account to stay unlocked on terms the person decides.
+    pub fn request_unlock(&mut self, signers: &mut Registry, requester: &str, params_json: &str) -> Result<(String, String)> {
+        self.admit(requester)?;
+        let p: UnlockParams = serde_json::from_str(params_json).map_err(|e| bad(format!("unlock: {e}")))?;
+        p.terms().check()?;
+        check_displayable(&p.reason, "reason")?;
+        let found = signers.find(&p.account)?;
+        let name = found.account.label.clone().unwrap_or_else(|| found.account.id.clone());
+        let mut lines = vec![
+            format!("{requester} asks to unlock {name}"),
+            format!("Terms asked: {}", p.terms().describe(requester)),
+        ];
+        if !p.reason.trim().is_empty() {
+            lines.push(format!("Reason (claimed by the requester): {}", p.reason.trim()));
+        }
+        Ok(self.push(requester, Kind::Unlock(p), lines))
+    }
+
+    pub fn queue(&mut self) -> Vec<Summary> {
+        self.sweep();
+        let now = Instant::now();
+        self.records
+            .iter()
+            .filter(|r| !matches!(r.state, State::Settled(_)))
+            .map(|r| Summary {
+                handle: r.handle.clone(),
+                requester: r.requester.clone(),
+                kind: match r.kind {
+                    Kind::Open(_) => "open",
+                    Kind::Unlock(_) => "unlock",
+                },
+                state: if r.state == State::Rendered { "rendered" } else { "offered" },
+                age_ms: now.duration_since(r.offered_at).as_millis(),
+            })
+            .collect()
+    }
+
+    pub fn acknowledge(&mut self, handle: &str) -> Result<Shown> {
+        self.sweep();
+        for r in &mut self.records {
+            if r.state == State::Rendered && r.handle != handle {
+                r.state = State::Offered;
+            }
+        }
+        let r = self.records.iter_mut().find(|r| r.handle == handle).ok_or_else(|| ManagerError::NotFound(handle.into()))?;
+        if let State::Settled(o) = r.state {
+            return Err(bad(format!("already settled: {o}")));
+        }
+        r.state = State::Rendered;
+        Ok(Shown {
+            handle: r.handle.clone(),
+            requester: r.requester.clone(),
+            kind: match r.kind {
+                Kind::Open(_) => "open",
+                Kind::Unlock(_) => "unlock",
+            },
+            bundle_id: hex::encode(r.bundle_id),
+            lines: r.lines.clone(),
+        })
+    }
+
+    /// The person decided in the keys app: the wallet, its password, and any unlock terms.
+    pub fn approve(
+        &mut self,
+        signers: &mut Registry,
+        keys: &mut dyn KeyHolder,
+        handle: &str,
+        bundle_id_echo: &str,
+        decision: Decision,
+    ) -> Result<()> {
+        self.sweep();
+        let idx = self.records.iter().position(|r| r.handle == handle).ok_or_else(|| ManagerError::NotFound(handle.into()))?;
+        let r = &self.records[idx];
+        if r.state != State::Rendered {
+            return Err(bad("approve_access: this handle was not the one being shown"));
+        }
+        if bundle_id_echo.trim().trim_start_matches("0x") != hex::encode(r.bundle_id) {
+            return Err(bad("approve_access: bundle_id does not match what was shown"));
+        }
+        let requester = r.requester.clone();
+        let password = Zeroizing::new(decision.password);
+        let (result, scope) = match &r.kind {
+            Kind::Open(p) => {
+                let group = match (&p.group, &decision.group) {
+                    (Some(asked), Some(picked)) if asked != picked => {
+                        return Err(bad("approve_access: this request names its wallet"));
+                    }
+                    (Some(g), _) | (None, Some(g)) => g.clone(),
+                    (None, None) => return Err(bad("approve_access: pick the wallet to open")),
+                };
+                let found = signers.find(&group)?;
+                let acct = AccountPublic::from_account(&found.account)?;
+                if let (Some(f), Some(n)) = (&p.family, &p.network) {
+                    if found.account.family != *f {
+                        return Err(bad("approve_access: the wallet picked is not the family asked for"));
+                    }
+                    acct.chain.network(n)?;
+                }
+                let terms = decision.unlock.or_else(|| p.unlock.clone());
+                let database_key = keys.database_key(&group, Some(&password))?;
+                let scope = match &terms {
+                    Some(t) => {
+                        t.check()?;
+                        keys.unlock(&group, &password, t.ttl_ms, t.count)?;
+                        Some(scope_for(&group, t, &requester))
+                    }
+                    None => None,
+                };
+                let result = serde_json::json!({
+                    "group": group, "family": found.account.family, "chain": acct.chain.as_str(),
+                    "external": acct.descriptor(0), "internal": acct.descriptor(1),
+                    "fingerprint": acct.fingerprint.to_string(), "databaseKey": database_key.as_str(),
+                    "unlocked": terms,
+                });
+                self.grants.retain(|(m, g)| !(m == &requester && g == &group));
+                self.grants.push((requester.clone(), group));
+                (result, scope)
+            }
+            Kind::Unlock(p) => {
+                let terms = decision.unlock.unwrap_or_else(|| p.terms());
+                terms.check()?;
+                let found = signers.find(&p.account)?;
+                let u = keys.unlock(&found.account.id, &password, terms.ttl_ms, terms.count)?;
+                let result = serde_json::json!({ "account": found.account.id, "terms": terms,
+                                                 "expiresInMs": u.expires_in_ms, "countLeft": u.count_left });
+                (result, Some(scope_for(&found.account.id, &terms, &requester)))
+            }
+        };
+        if let Some(s) = scope {
+            self.scopes.retain(|x| x.account != s.account);
+            self.scopes.push(s);
+        }
+        let r = &mut self.records[idx];
+        r.result = Some(result);
+        r.state = State::Settled("approved");
+        Ok(())
+    }
+
+    pub fn reject(&mut self, handle: &str) -> Result<()> {
+        let r = self.records.iter_mut().find(|r| r.handle == handle).ok_or_else(|| ManagerError::NotFound(handle.into()))?;
+        if let State::Settled(o) = r.state {
+            return Err(bad(format!("already settled: {o}")));
+        }
+        r.state = State::Settled("rejected");
+        Ok(())
+    }
+
+    pub fn status(&mut self, handle: &str, receipt: &str) -> Result<(&'static str, Option<&'static str>)> {
+        self.sweep();
+        Ok(match self.by_receipt(handle, receipt)?.state {
+            State::Offered => ("offered", None),
+            State::Rendered => ("rendered", None),
+            State::Settled(o) => ("settled", Some(o)),
+        })
+    }
+
+    /// The open's descriptors and database key, or the unlock's granted terms. Repeatable until acked.
+    pub fn fetch(&mut self, handle: &str, receipt: &str) -> Result<serde_json::Value> {
+        self.sweep();
+        self.by_receipt(handle, receipt)?.result.clone().ok_or_else(|| bad("no result for this handle"))
+    }
+
+    pub fn ack(&mut self, handle: &str, receipt: &str) -> Result<()> {
+        self.by_receipt(handle, receipt)?.result = None;
+        self.sweep();
+        Ok(())
+    }
+
+    pub fn cancel(&mut self, handle: &str, receipt: &str) -> Result<()> {
+        let r = self.by_receipt(handle, receipt)?;
+        if !matches!(r.state, State::Settled(_)) {
+            r.state = State::Settled("cancelled");
+        }
+        r.result = None;
+        self.sweep();
+        Ok(())
+    }
+
+    /// A wallet's descriptors again, for a module it is open for.
+    pub fn descriptors(&self, signers: &mut Registry, module: &str, group: &str) -> Result<(String, String)> {
+        if !self.grants.iter().any(|(m, g)| m == module && g == group.trim()) {
+            return Err(ManagerError::Refused("this wallet is not open for this module".into()));
+        }
+        let found = signers.find(group)?;
+        let acct = AccountPublic::from_account(&found.account)?;
+        Ok((acct.descriptor(0), acct.descriptor(1)))
+    }
+
+    /// Close a wallet for a module; an unlock scoped to that module alone ends with it.
+    pub fn close(&mut self, keys: &mut dyn KeyHolder, module: &str, group: &str) -> Result<bool> {
+        let before = self.grants.len();
+        self.grants.retain(|(m, g)| !(m == module && g == group.trim()));
+        let closed = self.grants.len() != before;
+        let account = lower(group);
+        if closed && self.scopes.iter().any(|s| s.account == account && s.apps == [module.to_string()]) {
+            self.scopes.retain(|s| s.account != account);
+            keys.lock(Some(group.trim()))?;
+        }
+        Ok(closed)
+    }
+
+    pub fn open_accounts(&self) -> Vec<(String, String)> {
+        self.grants.clone()
+    }
+
+    /// The person's own unlock from the keys app, with nobody asking.
+    pub fn unlock(&mut self, signers: &mut Registry, keys: &mut dyn KeyHolder, account: &str, password: &str, terms: &Terms) -> Result<Unlocked> {
+        terms.check()?;
+        if terms.apps.is_empty() {
+            return Err(bad("unlock: name the apps it covers"));
+        }
+        let found = signers.find(account)?;
+        let u = keys.unlock(&found.account.id, password, terms.ttl_ms, terms.count)?;
+        let s = scope_for(&found.account.id, terms, "");
+        self.scopes.retain(|x| x.account != s.account);
+        self.scopes.push(s);
+        Ok(u)
+    }
+
+    pub fn lock(&mut self, keys: &mut dyn KeyHolder, account: Option<&str>) -> Result<usize> {
+        match account {
+            Some(a) => self.scopes.retain(|s| s.account != lower(a)),
+            None => self.scopes.clear(),
+        }
+        keys.lock(account)
+    }
+
+    /// The keystore's unlocks, with the apps and confirmation this module keeps for each.
+    pub fn unlocked(&mut self, keys: &mut dyn KeyHolder) -> Result<Vec<(Unlocked, Vec<String>, bool)>> {
+        let held = keys.unlocked()?;
+        self.scopes.retain(|s| held.iter().any(|u| lower(&u.account) == s.account));
+        Ok(held
+            .into_iter()
+            .map(|u| {
+                let s = self.scopes.iter().find(|s| s.account == lower(&u.account));
+                let (apps, confirm) = s.map_or((Vec::new(), true), |s| (s.apps.clone(), s.confirm));
+                (u, apps, confirm)
+            })
+            .collect())
+    }
+
+    /// Does an unlock of `account` cover a request from `requester`, and how?
+    pub fn covers(&self, account: &str, requester: &str) -> Cover {
+        let Some(s) = self.scopes.iter().find(|s| s.account == lower(account)) else { return Cover::No };
+        let named = s.apps.iter().any(|a| a == requester);
+        match (named, s.apps.iter().any(|a| a == "*"), s.confirm) {
+            (true, _, false) => Cover::WithoutAsking,
+            (true, _, true) | (false, true, true) => Cover::Confirmed,
+            _ => Cover::No,
+        }
+    }
+
+    /// The keystore answered `locked` for an account this module thought unlocked: its time or count ran out.
+    pub fn expired(&mut self, account: &str) {
+        self.scopes.retain(|s| s.account != lower(account));
+    }
+}
+
+fn scope_for(account: &str, terms: &Terms, requester: &str) -> Scope {
+    let apps = if terms.apps.is_empty() { vec![requester.to_string()] } else { terms.apps.clone() };
+    Scope { account: lower(account), apps, confirm: terms.confirm }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use logos_signer_interface::mock::{MockOptions, MockSigner};
+
+    /// The keystore's extras, in memory: password "pw", a fixed database key, unlocks by account.
+    #[derive(Default)]
+    pub(crate) struct FakeKeys {
+        pub unlocks: Vec<Unlocked>,
+    }
+
+    impl KeyHolder for FakeKeys {
+        fn database_key(&mut self, _: &str, password: Option<&str>) -> Result<Zeroizing<String>> {
+            match password {
+                Some("pw") => Ok(Zeroizing::new("ab".repeat(32))),
+                _ => Err(ManagerError::Signer(logos_signer_interface::SignerError::new(
+                    logos_signer_interface::ErrorCode::WrongSecret,
+                    "the password for this account is not correct",
+                ))),
+            }
+        }
+        fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> Result<Unlocked> {
+            self.database_key(account, Some(password))?;
+            let u = Unlocked { account: account.to_ascii_lowercase(), expires_in_ms: ttl_ms, count_left: count };
+            self.unlocks.retain(|x| x.account != u.account);
+            self.unlocks.push(u.clone());
+            Ok(u)
+        }
+        fn lock(&mut self, account: Option<&str>) -> Result<usize> {
+            let before = self.unlocks.len();
+            match account {
+                Some(a) => self.unlocks.retain(|u| u.account != a.to_ascii_lowercase()),
+                None => self.unlocks.clear(),
+            }
+            Ok(before - self.unlocks.len())
+        }
+        fn unlocked(&mut self) -> Result<Vec<Unlocked>> {
+            Ok(self.unlocks.clone())
+        }
+    }
+
+    fn fixture() -> (Registry, FakeKeys, Access) {
+        let mut r = Registry::new();
+        r.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
+        (r, FakeKeys::default(), Access::new())
+    }
+
+    fn decide(group: Option<&str>, password: &str, unlock: Option<Terms>) -> Decision {
+        Decision { group: group.map(str::to_string), password: password.into(), unlock }
+    }
+
+    #[test]
+    fn an_open_request_gives_the_requester_its_wallet_and_nobody_else_its_descriptors() {
+        let (mut s, mut k, mut a) = fixture();
+        let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"family":"bitcoin","network":"signet"}"#).unwrap();
+        let shown = a.acknowledge(&h).unwrap();
+        assert!(shown.lines.join("\n").contains("Any native segwit wallet on signet"), "{:?}", shown.lines);
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).is_err(), "no wallet picked");
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-taproot"), "pw", None)).is_err(), "wrong family");
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "nope", None)).is_err());
+        assert_eq!(a.status(&h, &r).unwrap().0, "rendered", "a wrong password leaves it on screen");
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "pw", None)).unwrap();
+        let got = a.fetch(&h, &r).unwrap();
+        assert_eq!(got["group"], "mock-segwit");
+        assert_eq!(got["databaseKey"], "ab".repeat(32));
+        assert!(got["external"].as_str().unwrap().starts_with("wpkh(["));
+        let (ext, _) = a.descriptors(&mut s, "bitcoin_wallet_core_module", "mock-segwit").unwrap();
+        assert_eq!(ext, got["external"].as_str().unwrap());
+        assert!(a.descriptors(&mut s, "someone_else", "mock-segwit").is_err());
+        a.ack(&h, &r).unwrap();
+        assert!(a.fetch(&h, &r).is_err());
+        assert!(a.close(&mut k, "bitcoin_wallet_core_module", "mock-segwit").unwrap());
+        assert!(a.descriptors(&mut s, "bitcoin_wallet_core_module", "mock-segwit").is_err());
+    }
+
+    #[test]
+    fn an_open_with_unlock_terms_unlocks_for_the_requester_and_closing_locks_it() {
+        let (mut s, mut k, mut a) = fixture();
+        let (h, _) = a
+            .request_open(&mut s, "wallet_core", r#"{"group":"mock-taproot","unlock":{"ttlMs":3600000}}"#)
+            .unwrap();
+        let shown = a.acknowledge(&h).unwrap();
+        assert!(shown.lines.join("\n").contains("for 60 minutes, for wallet_core, each one confirmed"), "{:?}", shown.lines);
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).unwrap();
+        assert_eq!(a.covers("mock-taproot", "wallet_core"), Cover::Confirmed);
+        assert_eq!(a.covers("mock-taproot", "another_app"), Cover::No);
+        assert_eq!(k.unlocks.len(), 1);
+        a.close(&mut k, "wallet_core", "mock-taproot").unwrap();
+        assert_eq!(a.covers("mock-taproot", "wallet_core"), Cover::No);
+        assert!(k.unlocks.is_empty(), "an unlock scoped to the wallet ends when it closes");
+    }
+
+    #[test]
+    fn the_person_decides_the_terms_not_the_app() {
+        let (mut s, mut k, mut a) = fixture();
+        let (h, r) = a
+            .request_unlock(&mut s, "game", r#"{"account":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","count":50,"ttlMs":1800000,"confirm":false,"apps":["game"]}"#)
+            .unwrap();
+        let shown = a.acknowledge(&h).unwrap();
+        assert!(shown.lines.join("\n").contains("WITHOUT showing them to you"), "{:?}", shown.lines);
+        // The person keeps confirmation on and allows ten.
+        let granted = Terms { ttl_ms: Some(600_000), count: Some(10), apps: vec!["game".into()], confirm: true };
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", Some(granted))).unwrap();
+        let got = a.fetch(&h, &r).unwrap();
+        assert_eq!(got["terms"]["count"], 10);
+        assert_eq!(got["terms"]["confirm"], true);
+        assert_eq!(a.covers("0xF39FD6E51AAD88F6F4CE6AB8827279CFFFB92266", "game"), Cover::Confirmed);
+    }
+
+    #[test]
+    fn signing_without_asking_names_its_apps_and_any_app_needs_confirmation() {
+        let (mut s, mut k, mut a) = fixture();
+        let acct = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+        let any_unseen = Terms { ttl_ms: None, count: None, apps: vec!["*".into()], confirm: false };
+        assert!(a.unlock(&mut s, &mut k, acct, "pw", &any_unseen).is_err());
+        let named = Terms { ttl_ms: Some(60_000), count: Some(3), apps: vec!["game".into()], confirm: false };
+        a.unlock(&mut s, &mut k, acct, "pw", &named).unwrap();
+        assert_eq!(a.covers(acct, "game"), Cover::WithoutAsking);
+        assert_eq!(a.covers(acct, "wallet"), Cover::No);
+        let any_confirmed = Terms { ttl_ms: None, count: None, apps: vec!["*".into()], confirm: true };
+        a.unlock(&mut s, &mut k, acct, "pw", &any_confirmed).unwrap();
+        assert_eq!(a.covers(acct, "wallet"), Cover::Confirmed);
+        assert_eq!(a.lock(&mut k, None).unwrap(), 1);
+        assert_eq!(a.covers(acct, "wallet"), Cover::No);
+    }
+
+    #[test]
+    fn a_requester_cannot_flood_the_custodian() {
+        let (mut s, _, mut a) = fixture();
+        for _ in 0..MAX_PENDING_PER_REQUESTER {
+            a.request_open(&mut s, "noisy", r#"{"group":"mock-segwit"}"#).unwrap();
+        }
+        assert!(a.request_open(&mut s, "noisy", r#"{"group":"mock-segwit"}"#).is_err());
+        assert!(a.request_open(&mut s, "quiet", r#"{"group":"mock-segwit"}"#).is_ok());
+        assert!(a.request_open(&mut s, "x", r#"{"group":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"}"#).is_err(), "an EVM account is no wallet");
+    }
+}

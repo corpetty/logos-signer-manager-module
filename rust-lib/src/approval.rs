@@ -118,6 +118,8 @@ struct Record {
     claim_lines: Vec<String>,
     render_lines: Vec<String>,
     signer: String,
+    /// The account's id at its signer, for the unlock that may cover it.
+    account: String,
     state: State,
     offered_at: Instant,
     settled_at: Option<Instant>,
@@ -248,6 +250,7 @@ impl Approvals {
             claim_lines,
             render_lines,
             signer: prepared.found().name.clone(),
+            account: prepared.found().account.id.clone(),
             state: State::Offered,
             offered_at: Instant::now(),
             settled_at: None,
@@ -314,23 +317,58 @@ impl Approvals {
         Ok(Rendered { handle, bundle_id, requester, claim_lines, render_lines, signer, collects })
     }
 
+    /// Who asked, and for which account: what an unlock's scope is checked against.
+    pub fn requester_and_account(&self, handle: &str) -> Option<(String, String)> {
+        self.records.iter().find(|r| r.handle == handle).map(|r| (r.requester.clone(), r.account.clone()))
+    }
+
     /// The person said yes. Re-derives the commitment, checks the approver echoed what it showed,
-    /// and has the account's signer sign. A wrong secret leaves the record on screen.
-    pub fn approve(&mut self, signers: &mut Registry, handle: &str, bundle_id_echo: &str, secret: &str) -> Result<Approved> {
+    /// and has the account's signer sign. A wrong secret leaves the record on screen. With no
+    /// secret, a signer that collects one signs only inside an unlock that covers the requester.
+    pub fn approve(
+        &mut self,
+        signers: &mut Registry,
+        handle: &str,
+        bundle_id_echo: &str,
+        secret: &str,
+        unlocked: bool,
+    ) -> Result<Approved> {
         self.sweep();
         let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
         if r.state != State::Rendered {
             return Err(bad("approve: this handle was not the one being rendered"));
         }
+        self.sign(signers, handle, Some(bundle_id_echo), secret, unlocked)
+    }
+
+    /// Sign as the request arrives, inside an unlock the person granted without confirmation.
+    pub fn sign_unattended(&mut self, signers: &mut Registry, handle: &str) -> Result<Approved> {
+        let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
+        if r.state != State::Offered {
+            return Err(bad("sign_unattended: this request was already shown"));
+        }
+        self.sign(signers, handle, None, "", true)
+    }
+
+    fn sign(&mut self, signers: &mut Registry, handle: &str, echo: Option<&str>, secret: &str, unlocked: bool) -> Result<Approved> {
+        let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
         let prepared = prepare(signers, &r.intent)?;
         let fresh = commitment(&r.intent, &prepared)?;
         if fresh != r.bundle_id {
             return Err(bad("approve: commitment drift"));
         }
-        if bundle_id_echo.trim().trim_start_matches("0x") != hex::encode(fresh) {
+        if echo.is_some_and(|e| e.trim().trim_start_matches("0x") != hex::encode(fresh)) {
             return Err(bad("approve: bundle_id does not match the rendered request"));
         }
         let found = prepared.found().clone();
+        if secret.is_empty() && !unlocked && found.info.collects != logos_signer_interface::Collects::Nothing {
+            let e = logos_signer_interface::SignerError::new(
+                logos_signer_interface::ErrorCode::Locked,
+                format!("{} is not unlocked for {}: approve with its password", found.account.id, r.requester),
+            );
+            r.last_error = Some(e.message.clone());
+            return Err(e.into());
+        }
         if !found.info.request_kinds.contains(&RequestKind::Hash) {
             return Err(ManagerError::Refused(format!("{} signs whole requests; this manager hands it hashes only", found.name)));
         }
@@ -862,7 +900,7 @@ mod tests {
     }
 
     fn approve(ap: &mut Approvals, s: &mut Registry, h: &str, bundle: &str, pw: &str) -> Result<usize> {
-        match ap.approve(s, h, bundle, pw)? {
+        match ap.approve(s, h, bundle, pw, false)? {
             Approved::Settled(n) => Ok(n),
             Approved::Signing => Err(bad("still signing")),
         }
@@ -896,10 +934,10 @@ mod tests {
         let v = ap.acknowledge(&mut s, &h).unwrap();
         assert_eq!(v.signer, "keystore_module");
         assert_eq!(v.collects, Collects::Password);
-        let e = ap.approve(&mut s, &h, &v.bundle_id, "wrong").unwrap_err();
+        let e = ap.approve(&mut s, &h, &v.bundle_id, "wrong", false).unwrap_err();
         assert_eq!(e.code(), Some(ErrorCode::WrongSecret), "the approver can ask again: {e}");
         assert_eq!(ap.status(&mut s, &h, &r).unwrap().0, "rendered");
-        let e = ap.approve(&mut s, &h, &v.bundle_id, "").unwrap_err();
+        let e = ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap_err();
         assert_eq!(e.code(), Some(ErrorCode::Locked));
         assert_eq!(approve(&mut ap, &mut s, &h, &v.bundle_id, "pw").unwrap(), 1);
     }
@@ -1172,7 +1210,7 @@ mod tests {
         for intent in [tx_intent("0x1"), psbt_intent(&listed.id, &crate::psbt::tests::sample(&acct))] {
             let (h, r) = ap.request(&mut s, "x", &intent).unwrap();
             let v = ap.acknowledge(&mut s, &h).unwrap();
-            assert!(ap.approve(&mut s, &h, &v.bundle_id, "").is_err());
+            assert!(ap.approve(&mut s, &h, &v.bundle_id, "", false).is_err());
             assert_eq!(ap.status(&mut s, &h, &r).unwrap().0, "rendered", "back on screen");
             assert!(ap.fetch_result(&mut s, &h, &r).is_err());
             assert!(ap.pending(&mut s).iter().any(|p| p.handle == h && p.error.is_some()), "the approver is told why");
@@ -1226,7 +1264,7 @@ mod tests {
         let mut ap = Approvals::new();
         let (h, r) = ap.request(&mut s, "x", &tx_intent("0x1")).unwrap();
         let v = ap.acknowledge(&mut s, &h).unwrap();
-        assert_eq!(ap.approve(&mut s, &h, &v.bundle_id, "").unwrap(), Approved::Signing);
+        assert_eq!(ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap(), Approved::Signing);
         assert_eq!(ap.status(&mut s, &h, &r).unwrap().0, "signing");
         assert!(ap.acknowledge(&mut s, &h).is_err(), "nothing else can be approved over it");
         let job = ap.find(&h).unwrap().job.clone().unwrap();
@@ -1244,7 +1282,7 @@ mod tests {
         let mut ap = Approvals::new();
         let (h, r) = ap.request(&mut s, "x", &tx_intent("0x1")).unwrap();
         let v = ap.acknowledge(&mut s, &h).unwrap();
-        ap.approve(&mut s, &h, &v.bundle_id, "").unwrap();
+        ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap();
         let job = ap.find(&h).unwrap().job.clone().unwrap();
         device.press(&job, false);
         assert_eq!(ap.status(&mut s, &h, &r).unwrap(), ("settled", Some("rejected")));
@@ -1257,9 +1295,56 @@ mod tests {
         let mut ap = Approvals::new();
         let (h, r) = ap.request(&mut s, "x", &tx_intent("0x1")).unwrap();
         let v = ap.acknowledge(&mut s, &h).unwrap();
-        ap.approve(&mut s, &h, &v.bundle_id, "").unwrap();
+        ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap();
         let job = ap.find(&h).unwrap().job.clone().unwrap();
         ap.cancel(&mut s, &h, &r).unwrap();
         assert_eq!(s.signer(0).status(&job).unwrap().state, JobState::Cancelled);
+    }
+}
+
+#[cfg(test)]
+mod unlock_tests {
+    use super::*;
+    use logos_signer_interface::mock::{MockOptions, MockSigner};
+    use logos_signer_interface::{Collects, ErrorCode};
+
+    const ACCT0: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    fn intent() -> String {
+        format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"message","text":"inside an unlock"}}]}}"#)
+    }
+
+    /// A signer that asks for "pw" unless its account is unlocked, as the keystore does.
+    fn unlocked_keystore() -> Registry {
+        let mut r = Registry::new();
+        r.add("keystore_module", Box::new(MockSigner::new(MockOptions { collects: Collects::Password, secret: "pw".into(), ..Default::default() })));
+        r
+    }
+
+    #[test]
+    fn without_a_password_only_a_covering_unlock_signs() {
+        let mut s = unlocked_keystore();
+        let mut ap = Approvals::new();
+        let (h, _) = ap.request(&mut s, "wallet", &intent()).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        let e = ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap_err();
+        assert_eq!(e.code(), Some(ErrorCode::Locked));
+        assert!(e.to_string().contains("is not unlocked for wallet"), "{e}");
+        let (who, account) = ap.requester_and_account(&h).unwrap();
+        assert_eq!(who, "wallet");
+        assert!(account.eq_ignore_ascii_case(ACCT0), "{account}");
+    }
+
+    #[test]
+    fn signing_unattended_happens_only_before_anything_is_shown() {
+        let mut s = Registry::new();
+        s.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
+        let mut ap = Approvals::new();
+        let (h, r) = ap.request(&mut s, "game", &intent()).unwrap();
+        assert_eq!(ap.sign_unattended(&mut s, &h).unwrap(), Approved::Settled(1));
+        assert_eq!(ap.fetch_result(&mut s, &h, &r).unwrap().len(), 1);
+        let (h2, _) = ap.request(&mut s, "game", &intent()).unwrap();
+        ap.acknowledge(&mut s, &h2).unwrap();
+        assert!(ap.sign_unattended(&mut s, &h2).is_err(), "a request on screen waits for the person");
     }
 }

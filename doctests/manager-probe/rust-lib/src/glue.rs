@@ -20,6 +20,15 @@ pub trait ManagerProbeModule: Send + 'static {
     fn reject(&mut self, handle: String) -> bool;
     /// Ask the keystore to sign directly, past the manager: refused unless this were the manager.
     fn sign_direct(&mut self, request_json: String) -> String;
+    /// Ask the manager to open a Bitcoin wallet for this module, as a requester.
+    fn open(&mut self, params_json: String) -> String;
+    /// The manager's custodian: the queue, a request shown, and the person's decision.
+    fn queue(&mut self) -> String;
+    fn show(&mut self, handle: String) -> String;
+    fn decide(&mut self, params_json: String) -> String;
+    /// An open wallet's descriptors again, and closing it, as the module it is open for.
+    fn descriptors(&mut self, group: String) -> String;
+    fn close(&mut self, group: String) -> String;
 
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
 }
@@ -79,6 +88,30 @@ impl ManagerProbeModule for ManagerProbeModuleImpl {
 
     fn sign_direct(&mut self, request_json: String) -> String {
         pass(modules().keystore_module.sign(&request_json))
+    }
+
+    fn open(&mut self, params_json: String) -> String {
+        pass(modules().signer_manager_module.request_open(&params_json))
+    }
+
+    fn queue(&mut self) -> String {
+        pass(modules().signer_manager_module.access_requests())
+    }
+
+    fn show(&mut self, handle: String) -> String {
+        pass(modules().signer_manager_module.acknowledge_access(&handle))
+    }
+
+    fn decide(&mut self, params_json: String) -> String {
+        pass(modules().signer_manager_module.approve_access(&params_json))
+    }
+
+    fn descriptors(&mut self, group: String) -> String {
+        pass(modules().signer_manager_module.account_descriptors(&group))
+    }
+
+    fn close(&mut self, group: String) -> String {
+        pass(modules().signer_manager_module.close_account(&json!({ "group": group }).to_string()))
     }
 }
 
