@@ -17,7 +17,6 @@ jobs:
     secrets: inherit
     with:
       targets: default
-      # Unmeasured for this repo: keystore_module's 390 plus room for the signer interface's k256
-      # and bip32. Measure on the first run and tighten.
-      cold-derivation-budget: 430
+      # Measured 148 on 2026-10-10, at the harness's default of 150.
+      cold-derivation-budget: 200
       # No smoke: a module plugin has no entry point to run here; a consumer's job loads it.

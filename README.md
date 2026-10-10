@@ -16,7 +16,8 @@ A requester or an approver moving here changes only the module it calls. The res
 byte what the keystore returned when it signed itself.
 
 `accounts` lists every signer's accounts, without xpubs. `signers` says which signer modules are
-consulted. `configure` names the approvers, the custodians and the signers.
+consulted. `configure` names the approvers, the custodians and the signers. Unconfigured, it consults
+the keystore, then the Keycard Shell's and the Keycard's modules when they are installed.
 
 See [`docs/specs.md`](docs/specs.md) for the reference, and
 [`doctests/signer-manager-runtime.test.yaml`](doctests/signer-manager-runtime.test.yaml) for the
