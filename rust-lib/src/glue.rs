@@ -476,7 +476,8 @@ impl SignerManagerModule for SignerManagerModuleImpl {
             // `unlocked`: an unlock covers this request, so `approve` needs no password.
             Ok(v) => json!({ "ok": true, "handle": v.handle, "bundle_id": v.bundle_id, "requester": v.requester,
                              "claim_lines": v.claim_lines, "render_lines": v.render_lines,
-                             "signer": v.signer, "collects": v.collects, "unlocked": self.cover(&handle) != Cover::No })
+                             "signer": v.signer, "collects": v.collects, "account": v.account,
+                             "unlocked": self.cover(&handle) != Cover::No })
             .to_string(),
             Err(e) => err(e),
         }

@@ -151,6 +151,8 @@ pub struct Rendered {
     /// The module that will sign, and what `approve` must carry for it.
     pub signer: String,
     pub collects: logos_signer_interface::Collects,
+    /// The account at its signer: an address, or a Bitcoin wallet's id. What an unlock names.
+    pub account: String,
 }
 
 pub struct Summary {
@@ -300,13 +302,14 @@ impl Approvals {
                 r.claimed = true;
             }
         }
-        let (handle, bundle_id, requester, claim_lines, render_lines, signer) = (
+        let (handle, bundle_id, requester, claim_lines, render_lines, signer, account) = (
             r.handle.clone(),
             hex::encode(r.bundle_id),
             r.requester.clone(),
             r.claim_lines.clone(),
             r.render_lines.clone(),
             r.signer.clone(),
+            r.account.clone(),
         );
         let collects = signers
             .infos()
@@ -314,7 +317,7 @@ impl Approvals {
             .find(|(n, _)| *n == signer)
             .and_then(|(_, i)| i)
             .map_or(logos_signer_interface::Collects::Nothing, |i| i.collects);
-        Ok(Rendered { handle, bundle_id, requester, claim_lines, render_lines, signer, collects })
+        Ok(Rendered { handle, bundle_id, requester, claim_lines, render_lines, signer, collects, account })
     }
 
     /// Who asked, and for which account: what an unlock's scope is checked against.
@@ -934,6 +937,7 @@ mod tests {
         let v = ap.acknowledge(&mut s, &h).unwrap();
         assert_eq!(v.signer, "keystore_module");
         assert_eq!(v.collects, Collects::Password);
+        assert_eq!(v.account.to_lowercase(), ACCT0.to_lowercase(), "what an unlock of it names");
         let e = ap.approve(&mut s, &h, &v.bundle_id, "wrong", false).unwrap_err();
         assert_eq!(e.code(), Some(ErrorCode::WrongSecret), "the approver can ask again: {e}");
         assert_eq!(ap.status(&mut s, &h, &r).unwrap().0, "rendered");
