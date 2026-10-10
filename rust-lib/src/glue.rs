@@ -98,7 +98,8 @@ pub trait SignerManagerModule: Send + 'static {
     fn accounts(&mut self) -> String;
     /// The signer modules consulted, with what each says it is: `{ ok, signers: [{ name, info? }] }`.
     fn signers(&mut self) -> String;
-    /// What this module sees as its caller.
+    /// What this module sees as its caller, with the roles and signers in force:
+    /// `{ ok, kind, identity, approvers, custodians, signers }`.
     fn caller_identity(&mut self) -> String;
     /// Framework hook — defaulted, so not part of the IPC contract.
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
@@ -772,8 +773,9 @@ impl SignerManagerModule for SignerManagerModuleImpl {
             logos_rust_sdk::LogosCaller::Derived { parent, leaf } => ("derived", format!("{parent}.{leaf}")),
             logos_rust_sdk::LogosCaller::Operator { name } => ("operator", name.clone()),
         };
-        json!({ "ok": true, "kind": kind, "identity": name,
-                "approvers": self.roles.approvers, "custodians": self.roles.custodians })
+        // The whole configuration, so an approver can build a `configure` that keeps it: it is total.
+        json!({ "ok": true, "kind": kind, "identity": name, "approvers": self.roles.approvers,
+                "custodians": self.roles.custodians, "signers": self.roles.signers })
         .to_string()
     }
 }

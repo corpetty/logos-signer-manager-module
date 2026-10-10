@@ -87,7 +87,7 @@ false signature past the checks above.
 | `reject` | `handle` | `bool` |
 | `accounts` | — | `{ ok, accounts: [{ id, family, chain?, address?, label?, signer, available }] }` |
 | `signers` | — | `{ ok, signers: [{ name, info? }] }` |
-| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians }` |
+| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, signers }`: everything a total `configure` must repeat |
 | `request_open`, `request_unlock` | `params_json` | `{ ok, handle, receipt, state }` |
 | `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }` |
 | `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines }` |
