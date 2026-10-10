@@ -47,7 +47,7 @@ pub trait SignerManagerModule: Send + 'static {
     /// Claim a request for display: `{ ok, handle, bundle_id, requester, claim_lines,
     /// render_lines, signer, collects }`. `collects` says what `approve` must carry.
     fn acknowledge(&mut self, handle: String) -> String;
-    /// The person said yes: `{ ok, signed }` once signed, or `{ ok, state: "signing" }` while a
+    /// The person said yes: `{ ok, signed_count }` once signed, or `{ ok, state: "signing" }` while a
     /// device works. A wrong password answers `{ ok: false, code: "wrong_secret" }` and the request
     /// stays on screen. `password` is the vault password or a card's PIN, or empty.
     fn approve(&mut self, handle: String, bundle_id: String, password: String) -> String;
@@ -486,7 +486,7 @@ impl SignerManagerModule for SignerManagerModuleImpl {
         match self.approvals.approve(&mut self.signers, &handle, &bundle_id, &password, unlocked) {
             Ok(Approved::Settled(n)) => {
                 emit_approval_settled(&handle, "approved");
-                json!({ "ok": true, "signed": n }).to_string()
+                json!({ "ok": true, "signed_count": n }).to_string()
             }
             Ok(Approved::Signing) => {
                 emit_approval_progress(&handle, "signing");

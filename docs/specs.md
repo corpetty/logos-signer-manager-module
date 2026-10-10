@@ -83,7 +83,7 @@ false signature past the checks above.
 | `cancel_approval` | `handle, receipt` | `bool`; a signer still working is told to stop |
 | `pending` | — | `{ ok, pending: [{ handle, requester, state, purpose, legs, ageMs, error? }] }` |
 | `acknowledge` | `handle` | `{ ok, handle, bundle_id, requester, claim_lines, render_lines, signer, collects }` |
-| `approve` | `handle, bundle_id, password` | `{ ok, signed }`, or `{ ok, state: "signing" }`, or `{ ok: false, code, error }` |
+| `approve` | `handle, bundle_id, password` | `{ ok, signed_count }`, or `{ ok, state: "signing" }`, or `{ ok: false, code, error }` |
 | `reject` | `handle` | `bool` |
 | `accounts` | — | `{ ok, accounts: [{ id, family, chain?, address?, label?, signer, available }] }` |
 | `signers` | — | `{ ok, signers: [{ name, info? }] }` |

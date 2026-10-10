@@ -169,7 +169,7 @@ sections:
           logoscore call manager_probe approve <handle> <bundle_id> pw
           logoscore call manager_probe fetch <handle> <receipt>
         expect_contains:
-          - '\"signed\":1'
+          - '\"signed_count\":1'
           - "0x0eb9f28352f7922f2cbd640d4569c5dce34e261a78413a14f029f34e3fdb6685799fe51ca446a9998cba505370e0f4e11cb8ae05d0cdef67f44fb940f04c693b1c"
       - title: "Nothing but the manager can ask the keystore to sign"
         text: |
