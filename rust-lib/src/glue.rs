@@ -69,8 +69,9 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked }`. `asked` is
     /// `{ group, family, network, unlock }` for an open and `{ account, terms }` for an unlock. Tier D.
     fn acknowledge_access(&self, handle: String) -> String;
-    /// The person decided: `{ handle, bundle_id, group?, password, unlock? }` → `{ ok }`, or
-    /// `{ ok: false, code: "wrong_secret" }` with the request left on screen. Tier D.
+    /// The person decided: `{ handle, bundle_id, group?, password, unlock?, birthday? }` → `{ ok }`,
+    /// or `{ ok: false, code: "wrong_secret" }` with the request left on screen. For a device
+    /// account the password is its database key's, set at its first open with the `birthday`. Tier D.
     fn approve_access(&self, params_json: String) -> String;
     /// The person said no. Tier D.
     fn reject_access(&self, handle: String) -> bool;
@@ -205,6 +206,15 @@ fn keystore_reply(reply: Result<String, logos_rust_sdk::LogosError>) -> crate::R
     Ok(logos_signer_interface::wire::parse_reply(&reply)?)
 }
 
+/// What the keystore released for an open: the key, and where the wallet's history starts.
+fn opened_wallet(v: &serde_json::Value) -> OpenedWallet {
+    let key = v.get("databaseKey").and_then(|k| k.as_str()).unwrap_or_default();
+    // A keystore from before origins were kept says neither: the wallet core then scans the most.
+    let origin = v.get("origin").and_then(|o| o.as_str()).filter(|o| *o == "created").unwrap_or("restored");
+    let birthday = v.get("birthday").and_then(|b| b.as_str()).filter(|b| is_day(b)).map(str::to_string);
+    OpenedWallet { database_key: Zeroizing::new(key.to_string()), origin: origin.into(), birthday }
+}
+
 /// `YYYY-MM-DD`, as the keystore writes a birthday; anything else is dropped, not passed on.
 fn is_day(s: &str) -> bool {
     s.len() == 10 && s.bytes().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() })
@@ -213,12 +223,15 @@ fn is_day(s: &str) -> bool {
 impl KeyHolder for KeystoreKeys {
     fn database_key(&mut self, group: &str, password: Option<&str>) -> crate::Result<OpenedWallet> {
         let body = Zeroizing::new(json!({ "group": group, "password": password }).to_string());
-        let v = keystore_reply(modules().keystore_module.database_key(&body))?;
-        let key = v.get("databaseKey").and_then(|k| k.as_str()).unwrap_or_default();
-        // A keystore from before origins were kept says neither: the wallet core then scans the most.
-        let origin = v.get("origin").and_then(|o| o.as_str()).filter(|o| *o == "created").unwrap_or("restored");
-        let birthday = v.get("birthday").and_then(|b| b.as_str()).filter(|b| is_day(b)).map(str::to_string);
-        Ok(OpenedWallet { database_key: Zeroizing::new(key.to_string()), origin: origin.into(), birthday })
+        Ok(opened_wallet(&keystore_reply(modules().keystore_module.database_key(&body))?))
+    }
+
+    fn device_database_key(&mut self, signer: &str, account: &str, password: &str, birthday: Option<&str>)
+        -> crate::Result<OpenedWallet> {
+        let body = Zeroizing::new(
+            json!({ "signer": signer, "account": account, "password": password, "birthday": birthday }).to_string(),
+        );
+        Ok(opened_wallet(&keystore_reply(modules().keystore_module.device_database_key(&body))?))
     }
 
     fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> crate::Result<Unlocked> {
@@ -650,12 +663,16 @@ impl Core {
             password: String,
             #[serde(default)]
             unlock: Option<Terms>,
+            /// A device wallet's first day of use, at its first open.
+            #[serde(default)]
+            birthday: Option<String>,
         }
         let w: Wire = match serde_json::from_str(&params_json) {
             Ok(w) => w,
             Err(e) => return err(format!("approve_access: {e}")),
         };
-        let decision = Decision { group: w.group, password: w.password, unlock: w.unlock };
+        let birthday = w.birthday.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+        let decision = Decision { group: w.group, password: w.password, unlock: w.unlock, birthday };
         self.refresh();
         match self.access.approve(&mut self.signers, &mut KeystoreKeys, &w.handle, &w.bundle_id, decision) {
             Ok(()) => {
