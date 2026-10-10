@@ -294,17 +294,25 @@ sections:
           - '\"state\":\"signing\"'
           - '\"account\":\"0x9858effd232b4033e47d90003d41ec34ecaeda94\"'
       - title: "The person confirms on the device, and the requester collects"
+        text: |
+          The manager listens to the device, so it announces `approval_settled` when the answer
+          comes. A requester that only listens hears it without asking anyone.
         run: |
           ./logos/bin/logoscore call mock_device_signer screen > screen.json
           python3 -c 'import json; print(json.loads(json.load(open("screen.json"))["result"])["waiting"][0]["job"])' > djob
+          ./logos/bin/logoscore call manager_probe heard > /dev/null
           ./logos/bin/logoscore call mock_device_signer press "$(cat djob)" confirm
+          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard > heard.json; grep -q "$(cat dhandle)" heard.json && break; sleep 0.5; done
+          cat heard.json
           ./logos/bin/logoscore call manager_probe status "$(cat dhandle)" "$(cat dreceipt)"
           ./logos/bin/logoscore call manager_probe fetch "$(cat dhandle)" "$(cat dreceipt)"
         code_block: |
           logoscore call mock_device_signer press <job> confirm
+          logoscore call manager_probe heard                         # approval_settled, unasked
           logoscore call manager_probe status <handle> <receipt>
           logoscore call manager_probe fetch <handle> <receipt>
         expect_contains:
+          - '\"event\":\"approval_settled\"'
           - '\"reason\":\"approved\"'
           - '\"signed\":[\"0x'
       - title: "A refusal on the device ends the request"
@@ -344,6 +352,25 @@ sections:
         expect_contains:
           - '\"state\":\"rendered\"'
           - "recovers to"
+      - title: "Unplugged, its accounts stay listed, and listeners hear at once"
+        text: |
+          A device that goes away keeps its accounts in the list, marked unavailable. The manager
+          announces `accounts_changed` as soon as the device reports it, so an app that only
+          listens, such as the keys app, shows it at once.
+        run: |
+          ./logos/bin/logoscore call manager_probe heard > /dev/null
+          ./logos/bin/logoscore call mock_device_signer plug false
+          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard > heard.json; grep -q accounts_changed heard.json && break; sleep 0.5; done
+          cat heard.json
+          ./logos/bin/logoscore call signer_manager_module accounts
+          ./logos/bin/logoscore call mock_device_signer plug true
+        code_block: |
+          logoscore call mock_device_signer plug false
+          logoscore call manager_probe heard                         # accounts_changed, unasked
+          logoscore call signer_manager_module accounts              # the device's: "available":false
+        expect_contains:
+          - '\"event\":\"accounts_changed\"'
+          - '\"available\":false'
 
   - title: "Stop"
     step: true

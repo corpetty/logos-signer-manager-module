@@ -183,6 +183,10 @@ to `signing`, and `accounts_changed` (count) after a signer reports its accounts
 and unlocking: `access_requested`, `access_settled`, `unlock_changed` (account) and
 `signed_without_asking` (handle). Handles only: the event plane is unauthenticated.
 
+The manager listens to each signer's `signer_accounts_changed` and `sign_progress`, and announces
+what they change as they come: a device plugged out, or a job its person ended on the device. An app
+that only listens hears it without anyone calling the manager first.
+
 ## The signers
 
 Signer modules are bound at runtime through the `signer` interface dependency

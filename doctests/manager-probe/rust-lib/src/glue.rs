@@ -29,6 +29,9 @@ pub trait ManagerProbeModule: Send + 'static {
     /// An open wallet's descriptors again, and closing it, as the module it is open for.
     fn descriptors(&mut self, group: String) -> String;
     fn close(&mut self, group: String) -> String;
+    /// The manager's events heard since the last call, as a listening requester hears them:
+    /// `{ ok, events: [{ event, data }] }`.
+    fn heard(&mut self) -> String;
 
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
 }
@@ -36,7 +39,9 @@ pub trait ManagerProbeModule: Send + 'static {
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 
 #[derive(Default)]
-struct ManagerProbeModuleImpl;
+struct ManagerProbeModuleImpl {
+    heard: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
 
 fn pass(reply: Result<String, impl std::fmt::Debug>) -> String {
     match reply {
@@ -112,6 +117,28 @@ impl ManagerProbeModule for ManagerProbeModuleImpl {
 
     fn close(&mut self, group: String) -> String {
         pass(modules().signer_manager_module.close_account(&json!({ "group": group }).to_string()))
+    }
+
+    fn heard(&mut self) -> String {
+        let events = std::mem::take(&mut *self.heard.lock().unwrap());
+        json!({ "ok": true, "events": events }).to_string()
+    }
+
+    fn on_context_ready(&mut self, _ctx: &RustModuleContext) {
+        // Off the dispatch thread: subscribing may wait on the manager.
+        let heard = self.heard.clone();
+        std::thread::spawn(move || {
+            let mut m = modules();
+            let subs = [m.signer_manager_module.on_approval_settled(), m.signer_manager_module.on_accounts_changed()];
+            for sub in subs.into_iter().flatten() {
+                let heard = heard.clone();
+                std::thread::spawn(move || {
+                    for ev in sub {
+                        heard.lock().unwrap().push(json!({ "event": ev.event, "data": ev.data }));
+                    }
+                });
+            }
+        });
     }
 }
 
