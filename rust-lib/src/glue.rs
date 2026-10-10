@@ -5,7 +5,6 @@
 //! `{ "ok": false, "error": "...", "code"? }`. The approval API keeps keystore_module's names and
 //! shapes, so a requester or an approver changes only the module it calls.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -276,8 +275,8 @@ struct Core {
     unattended: Vec<Unattended>,
     roles: gate::Roles,
     signers: Registry,
-    /// Set by a listener when any signer's accounts change.
-    stale: Arc<AtomicBool>,
+    /// The signers whose accounts changed, named by their listeners.
+    stale: Arc<std::sync::Mutex<Vec<String>>>,
     started: bool,
     /// This core, for the listeners: a signer's news is announced when it comes, not at the next call.
     me: Weak<std::sync::Mutex<Core>>,
@@ -349,10 +348,10 @@ impl Core {
             r.add(name.clone(), Box::new(IpcSigner { name: name.clone() }));
             let mut client = signer::SignerClient::bind(name);
             if let Ok(sub) = client.on_signer_accounts_changed() {
-                let (stale, me) = (self.stale.clone(), self.me.clone());
+                let (stale, me, name) = (self.stale.clone(), self.me.clone(), name.clone());
                 std::thread::spawn(move || {
                     for _ in sub {
-                        stale.store(true, Ordering::SeqCst);
+                        stale.lock().unwrap_or_else(|e| e.into_inner()).push(name.clone());
                         nudge(&me);
                     }
                 });
@@ -375,8 +374,10 @@ impl Core {
         if !self.started {
             self.bind_signers();
         }
-        if self.stale.swap(false, Ordering::SeqCst) {
-            self.signers.forget();
+        let changed = std::mem::take(&mut *self.stale.lock().unwrap_or_else(|e| e.into_inner()));
+        if !changed.is_empty() {
+            // Only the signers that announced: a module that isn't installed keeps resting.
+            self.signers.forget(&changed);
             emit_accounts_changed(self.signers.accounts().len() as i64);
         }
         // A device ends its job in its own time: look, and announce what that moved.
