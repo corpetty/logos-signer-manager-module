@@ -165,12 +165,20 @@ wallet for it in the keys app, and an account stays unlocked only on terms a per
 - `request_unlock` takes `{ account, ttlMs?, count?, apps?, confirm?, reason? }`, the terms an app
   asks for. `fetch_result` returns `{ ok, result: { account, terms, expiresInMs, countLeft } }`:
   the terms the person granted, which may differ.
+- **A device account** is one any signer but the keystore offers. Its database key comes from the
+  keystore's `device_database_key`, made at the first open under the password the person sets in
+  the keys app, with the first day of use they give as `birthday` in `approve_access`. Every later
+  open needs that password. A device signs on its own screen, so it has nothing to unlock: terms in
+  the decision are refused, the app's own are not granted, and `request_unlock` for it is refused
+  before anything is shown. Its `origin` is always `restored`, since a device keeps no record of
+  when its seed was made. A keystore wallet's birthday was set when it was made, so a decision
+  that gives one for it is refused.
 - A requester has at most two open or unlock requests pending, and one nobody shows within five
   minutes settles `expired_no_ack`.
 - The custodian (the keys app) works the queue with `access_requests`, `acknowledge_access` (the
   lines to show, the commitment to echo, and `asked`: the wallet or the family and network to pick
   from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?,
-  password, unlock? }`) and `reject_access`. A wrong password answers `code: wrong_secret` and
+  password, unlock?, birthday? }`) and `reject_access`. A wrong password answers `code: wrong_secret` and
   leaves the request on screen. The database key comes from the keystore's `database_key`, the
   unlock from its `unlock`; the manager keeps neither.
 - The keys app also unlocks and locks on its own: `unlock` (`{ account, password, ttlMs?,

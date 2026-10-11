@@ -35,9 +35,15 @@ pub struct OpenedWallet {
     pub birthday: Option<String>,
 }
 
+/// The signer whose Bitcoin wallets keep their database key in their own vault; any other is a device.
+const KEYSTORE: &str = "keystore_module";
+
 /// What the keystore does for an open or an unlock, beyond the signer interface.
 pub trait KeyHolder {
     fn database_key(&mut self, group: &str, password: Option<&str>) -> Result<OpenedWallet>;
+    /// A device account's database key, made at its first open under the password the person set.
+    fn device_database_key(&mut self, signer: &str, account: &str, password: &str, birthday: Option<&str>)
+        -> Result<OpenedWallet>;
     fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> Result<Unlocked>;
     fn lock(&mut self, account: Option<&str>) -> Result<usize>;
     fn unlocked(&mut self) -> Result<Vec<Unlocked>>;
@@ -195,6 +201,8 @@ pub struct Decision {
     pub group: Option<String>,
     pub password: String,
     pub unlock: Option<Terms>,
+    /// A device wallet's first day of use, given at its first open.
+    pub birthday: Option<String>,
 }
 
 pub struct Shown {
@@ -356,6 +364,9 @@ impl Access {
         p.terms().check()?;
         check_displayable(&p.reason, "reason")?;
         let found = signers.find(&p.account)?;
+        if found.name != KEYSTORE {
+            return Err(bad("unlock: a device account signs on its device; there is nothing to unlock"));
+        }
         let name = found.account.label.clone().unwrap_or_else(|| found.account.id.clone());
         let mut lines = vec![
             format!("{requester} asks to unlock {name}"),
@@ -452,8 +463,20 @@ impl Access {
                     }
                     acct.chain.network(n)?;
                 }
-                let terms = decision.unlock.or_else(|| p.unlock.clone());
-                let opened = keys.database_key(&group, Some(&password))?;
+                // A device account signs on its device, and its database key has a vault of its own.
+                let on_device = found.name != KEYSTORE;
+                if on_device && decision.unlock.is_some() {
+                    return Err(bad("approve_access: a device account signs on its device; there is nothing to unlock"));
+                }
+                if !on_device && decision.birthday.is_some() {
+                    return Err(bad("approve_access: a keystore wallet's birthday was set when it was made"));
+                }
+                let terms = if on_device { None } else { decision.unlock.or_else(|| p.unlock.clone()) };
+                let opened = if on_device {
+                    keys.device_database_key(&found.name, &found.account.id, &password, decision.birthday.as_deref())?
+                } else {
+                    keys.database_key(&group, Some(&password))?
+                };
                 let scope = match &terms {
                     Some(t) => {
                         t.check()?;
@@ -626,6 +649,8 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct FakeKeys {
         pub unlocks: Vec<Unlocked>,
+        /// Device wallets by signer and account: their password, key and birthday.
+        pub devices: std::collections::HashMap<(String, String), (String, String, Option<String>)>,
     }
 
     impl KeyHolder for FakeKeys {
@@ -641,6 +666,20 @@ pub(crate) mod tests {
                     "the password for this account is not correct",
                 ))),
             }
+        }
+        fn device_database_key(&mut self, signer: &str, account: &str, password: &str, birthday: Option<&str>)
+            -> Result<OpenedWallet> {
+            let n = self.devices.len() + 1;
+            let (pw, key, day) = self.devices.entry((signer.into(), account.into())).or_insert_with(|| {
+                (password.into(), format!("{n:02x}").repeat(32), birthday.map(str::to_string))
+            });
+            if pw != password {
+                return Err(ManagerError::Signer(logos_signer_interface::SignerError::new(
+                    logos_signer_interface::ErrorCode::WrongSecret,
+                    "the password for this wallet's database key is not correct",
+                )));
+            }
+            Ok(OpenedWallet { database_key: Zeroizing::new(key.clone()), origin: "restored".into(), birthday: day.clone() })
         }
         fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> Result<Unlocked> {
             self.database_key(account, Some(password))?;
@@ -685,7 +724,60 @@ pub(crate) mod tests {
     }
 
     fn decide(group: Option<&str>, password: &str, unlock: Option<Terms>) -> Decision {
-        Decision { group: group.map(str::to_string), password: password.into(), unlock }
+        Decision { group: group.map(str::to_string), password: password.into(), unlock, birthday: None }
+    }
+
+    /// A device's module offering the mock's accounts, and no keystore.
+    fn device_fixture() -> (Registry, FakeKeys, Access) {
+        let mut r = Registry::new();
+        r.add("keycard_shell_module", Box::new(MockSigner::new(MockOptions::default())));
+        (r, FakeKeys::default(), Access::new())
+    }
+
+    #[test]
+    fn a_device_wallet_opens_with_a_password_set_at_its_first_open_and_has_nothing_to_unlock() {
+        let (mut s, mut k, mut a) = device_fixture();
+        let ask = r#"{"group":"mock-segwit","network":"regtest","unlock":{"ttlMs":60000}}"#;
+        let open = |a: &mut Access, s: &mut Registry| {
+            let (h, r) = a.request_open(s, "bitcoin_wallet_core_module", ask).unwrap();
+            let bundle = a.acknowledge(&h).unwrap().bundle_id;
+            (h, r, bundle)
+        };
+        let decision = |pw: &str, unlock: Option<Terms>, birthday: Option<&str>| Decision {
+            group: None,
+            password: pw.into(),
+            unlock,
+            birthday: birthday.map(str::to_string),
+        };
+        let (h, r, b) = open(&mut a, &mut s);
+        let terms = Terms { ttl_ms: Some(1000), confirm: true, ..Default::default() };
+        assert!(a.approve(&mut s, &mut k, &h, &b, decision("data-pw", Some(terms), None)).is_err(), "nothing to unlock");
+        a.approve(&mut s, &mut k, &h, &b, decision("data-pw", None, Some("2021-11-14"))).unwrap();
+        let got = a.fetch(&h, &r).unwrap();
+        assert_eq!((got["origin"].as_str(), got["birthday"].as_str()), (Some("restored"), Some("2021-11-14")));
+        assert_eq!(got["unlocked"], serde_json::Value::Null, "the app asked for terms; a device grants none");
+        assert!(k.devices.contains_key(&("keycard_shell_module".to_string(), "mock-segwit".to_string())));
+        let first = got["databaseKey"].as_str().unwrap().to_string();
+
+        // Opened again: the same key, behind the password set the first time.
+        let (h, r, b) = open(&mut a, &mut s);
+        assert!(a.approve(&mut s, &mut k, &h, &b, decision("nope", None, None)).is_err());
+        assert_eq!(a.status(&h, &r).unwrap().0, "rendered", "a wrong password leaves it on screen");
+        a.approve(&mut s, &mut k, &h, &b, decision("data-pw", None, None)).unwrap();
+        assert_eq!(a.fetch(&h, &r).unwrap()["databaseKey"].as_str(), Some(first.as_str()));
+
+        // And an unlock is refused before anything is shown.
+        let unlock = r#"{"account":"mock-segwit","ttlMs":60000}"#;
+        assert!(a.request_unlock(&mut s, "bitcoin_wallet_core_module", unlock).is_err());
+    }
+
+    #[test]
+    fn a_keystore_wallet_takes_no_birthday_at_open() {
+        let (mut s, mut k, mut a) = fixture();
+        let (h, _) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"group":"mock-segwit","network":"regtest"}"#).unwrap();
+        let bundle = a.acknowledge(&h).unwrap().bundle_id;
+        let d = Decision { group: None, password: "pw".into(), unlock: None, birthday: Some("2021-11-14".into()) };
+        assert!(a.approve(&mut s, &mut k, &h, &bundle, d).is_err(), "it was set when the wallet was made");
     }
 
     #[test]
