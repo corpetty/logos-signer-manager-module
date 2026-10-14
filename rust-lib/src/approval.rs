@@ -126,6 +126,7 @@ struct Record {
     claimed: bool,
     /// The signer's job while `Signing`.
     job: Option<String>,
+    active_found: Option<Found>,
     /// Why the last approval didn't sign, for the approver.
     last_error: Option<String>,
     results: Option<Vec<String>>,
@@ -270,6 +271,7 @@ impl Approvals {
             settled_at: None,
             claimed: false,
             job: None,
+            active_found: None,
             last_error: None,
             results: None,
         });
@@ -314,6 +316,9 @@ impl Approvals {
                 r.claimed = true;
             }
         }
+        let prepared = prepare(signers, &r.intent)?;
+        kind_for(&r.intent, &prepared, &prepared.found().info)?;
+        r.signer = prepared.found().name.clone();
         let (handle, bundle_id, requester, claim_lines, render_lines, signer, account) = (
             r.handle.clone(),
             hex::encode(r.bundle_id),
@@ -376,6 +381,11 @@ impl Approvals {
             return Err(bad("approve: bundle_id does not match the rendered request"));
         }
         let found = prepared.found().clone();
+        if echo.is_some() && found.name != r.signer {
+            r.state = State::Offered;
+            r.last_error = Some("Signing connection changed. Review the request again for the current connection.".into());
+            return Err(bad(r.last_error.clone().unwrap()));
+        }
         if secret.is_empty() && !unlocked && found.info.collects != logos_signer_interface::Collects::Nothing {
             let e = logos_signer_interface::SignerError::new(
                 logos_signer_interface::ErrorCode::Locked,
@@ -387,7 +397,7 @@ impl Approvals {
         let request = SignRequest {
             account: found.account.id.clone(),
             payload: payload_for(&r.intent, &prepared, &found.info)?,
-            secret: (!secret.is_empty()).then(|| Secret::new(secret)),
+            secret: (!secret.is_empty() && found.info.collects != logos_signer_interface::Collects::Nothing).then(|| Secret::new(secret)),
         };
         let signer = signers.signer(found.signer);
         let job = match signer.sign(request) {
@@ -397,6 +407,7 @@ impl Approvals {
                 return Err(e.into());
             }
         };
+        r.active_found = Some(found);
         r.job = Some(job);
         r.state = State::Signing;
         r.last_error = None;
@@ -426,7 +437,7 @@ impl Approvals {
         let Some(r) = self.find(handle) else { return };
         let Some(job) = r.job.clone() else { return };
         let outcome = (|| -> Result<Option<Vec<String>>> {
-            let prepared = prepare(signers, &r.intent)?;
+            let prepared = prepare_on(signers, &r.intent, r.active_found.clone())?;
             let found = prepared.found().clone();
             let signer = signers.signer(found.signer);
             let status = signer.status(&job)?;
@@ -521,7 +532,7 @@ impl Approvals {
 
 fn cancel_job(signers: &mut Registry, r: &mut Record) {
     if let Some(job) = r.job.take() {
-        if let Ok(found) = prepare(signers, &r.intent).map(|p| p.found().clone()) {
+        if let Some(found) = r.active_found.as_ref() {
             let _ = signers.signer(found.signer).cancel(&job);
         }
     }
@@ -549,6 +560,9 @@ fn evm_only() -> ManagerError {
 
 /// Check the intent's shape, find the account's signer, and read a Bitcoin request's PSBT.
 fn prepare(signers: &mut Registry, intent: &Intent) -> Result<Prepared> {
+    prepare_on(signers, intent, None)
+}
+fn prepare_on(signers: &mut Registry, intent: &Intent, pinned: Option<Found>) -> Result<Prepared> {
     let bitcoin = !intent.group.trim().is_empty();
     if bitcoin == !intent.address.trim().is_empty() {
         return Err(bad("intent: name exactly one of address (EVM) or group (Bitcoin)"));
@@ -558,7 +572,7 @@ fn prepare(signers: &mut Registry, intent: &Intent) -> Result<Prepared> {
             return Err(evm_only());
         }
         let addr = evm::parse_address(&intent.address)?;
-        let found = signers.find(&format!("{addr}"))?;
+        let found = match pinned { Some(f) => f, None => signers.find(&format!("{addr}"))? };
         if found.account.family != logos_signer_interface::Family::Evm {
             return Err(bad(format!("{} is not an EVM account", intent.address.trim())));
         }
@@ -567,7 +581,7 @@ fn prepare(signers: &mut Registry, intent: &Intent) -> Result<Prepared> {
     let [Leg::Psbt { network, psbt }] = intent.legs.as_slice() else {
         return Err(bad("intent: a Bitcoin request carries exactly one psbt leg"));
     };
-    let found = signers.find(intent.group.trim())?;
+    let found = match pinned { Some(f) => f, None => signers.find(intent.group.trim())? };
     let acct = AccountPublic::from_account(&found.account)?;
     let net: Network = acct.chain.network(network)?;
     let parsed = btcpsbt::parse(psbt)?;
@@ -1288,6 +1302,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_swapped_card_cannot_release_a_result_for_the_selected_account() {
+        use logos_signer_interface::mock::Doctor;
+        let mut intents = vec![tx_intent("0x1"), message_intent("swapped card"),
+            format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"typed_data","typed_data":{}}}]}}"#, mail_typed_data())];
+        for family in [crate::btc::Family::Segwit, crate::btc::Family::Taproot] {
+            let (_, listed, acct) = crate::psbt::tests::ours(family);
+            intents.push(psbt_intent(&listed.id, &crate::psbt::tests::sample(&acct)));
+        }
+        // Same asynchronous approval path as Shell: advertise the saved account, then
+        // return a valid signature from another key after the person confirms on-device.
+        for intent in intents {
+            let device = Device::new();
+            device.0.lock().unwrap().set_doctor(Doctor::OtherKey);
+            let mut registry = Registry::new();
+            registry.add("keycard_shell_module", Box::new(device.clone()));
+            let mut ap = Approvals::new();
+            let (handle, token) = ap.request(&mut registry, "wallet_app", &intent).unwrap();
+            let view = ap.acknowledge(&mut registry, &handle).unwrap();
+            assert_eq!(ap.approve(&mut registry, &handle, &view.bundle_id, "", false).unwrap(), Approved::Signing);
+            let job = ap.find(&handle).unwrap().job.clone().unwrap();
+            device.press(&job, true);
+            assert_eq!(ap.status(&mut registry, &handle, &token).unwrap().0, "rendered");
+            assert!(ap.fetch_result(&mut registry, &handle, &token).is_err(), "wrong-account signature escaped: {intent}");
+            assert!(ap.pending(&mut registry).iter().any(|p| p.handle == handle && p.error.is_some()));
+            ap.cancel(&mut registry, &handle, &token).unwrap();
+        }
+    }
+
     /// A device the test can press, shared with the registry.
     #[derive(Clone)]
     struct Device(std::sync::Arc<std::sync::Mutex<MockSigner>>);
@@ -1339,6 +1382,65 @@ mod tests {
         fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
             self.0.lock().unwrap().cancel(job)
         }
+    }
+
+
+    #[derive(Clone)]
+    struct Switchable { device: Device, connected: std::sync::Arc<std::sync::atomic::AtomicBool> }
+    impl Switchable {
+        fn new() -> Self { Self { device: Device::whole(), connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) } }
+        fn unplug(&self) { self.connected.store(false, std::sync::atomic::Ordering::SeqCst); }
+    }
+    impl Signer for Switchable {
+        fn info(&self) -> SignerInfo { self.device.info() }
+        fn accounts(&mut self) -> logos_signer_interface::Result<Vec<logos_signer_interface::Account>> {
+            let mut accounts = self.device.accounts()?;
+            for a in &mut accounts { a.available = self.connected.load(std::sync::atomic::Ordering::SeqCst); }
+            Ok(accounts)
+        }
+        fn sign(&mut self, r: SignRequest) -> logos_signer_interface::Result<String> { self.device.sign(r) }
+        fn status(&mut self, j: &str) -> logos_signer_interface::Result<JobStatus> { self.device.status(j) }
+        fn result(&mut self, j: &str) -> logos_signer_interface::Result<Vec<Signature>> { self.device.result(j) }
+        fn cancel(&mut self, j: &str) -> logos_signer_interface::Result<()> { self.device.cancel(j) }
+    }
+
+    #[test]
+    fn a_started_job_stays_with_its_signer_after_hotplug_for_results_and_cancellation() {
+        for cancel in [false, true] {
+            let reader = Switchable::new(); let shell = Switchable::new();
+            let mut s = Registry::new();
+            s.add("keycard_shell_module", Box::new(shell.clone()));
+            s.add("keycard_module", Box::new(reader.clone()));
+            assert_eq!(s.find(ACCT0).unwrap().name, "keycard_module", "verified reader wins over candidate Shell regardless of order");
+            let mut ap = Approvals::new();
+            let (h, receipt) = ap.request(&mut s, "x", &message_intent("route test")).unwrap();
+            let v = ap.acknowledge(&mut s, &h).unwrap();
+            assert_eq!(ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap(), Approved::Signing);
+            let (job, _) = reader.device.showing();
+            reader.unplug(); s.forget(&["keycard_module".into()]);
+            assert_eq!(s.find(ACCT0).unwrap().name, "keycard_shell_module");
+            if cancel {
+                ap.cancel(&mut s, &h, &receipt).unwrap();
+                assert_eq!(reader.device.clone().status(&job).unwrap().state, JobState::Cancelled);
+            } else {
+                reader.device.press(&job, true);
+                assert_eq!(ap.status(&mut s, &h, &receipt).unwrap(), ("settled", Some("approved")));
+                assert_eq!(ap.fetch_result(&mut s, &h, &receipt).unwrap().len(), 1);
+            }
+            assert!(shell.device.0.lock().unwrap().waiting().is_empty());
+        }
+    }
+
+    #[test]
+    fn changing_connection_after_display_requires_review_before_signing() {
+        let reader=Switchable::new(); let shell=Switchable::new(); let mut s=Registry::new();
+        s.add("keycard_module",Box::new(reader.clone())); s.add("keycard_shell_module",Box::new(shell.clone()));
+        let mut ap=Approvals::new(); let (h,_)=ap.request(&mut s,"x",&message_intent("route review")).unwrap();
+        let v=ap.acknowledge(&mut s,&h).unwrap();
+        reader.unplug(); s.forget(&["keycard_module".into()]);
+        assert!(ap.approve(&mut s,&h,&v.bundle_id,"",false).unwrap_err().to_string().contains("connection changed"));
+        assert!(shell.device.0.lock().unwrap().waiting().is_empty());
+        assert_eq!(ap.acknowledge(&mut s,&h).unwrap().signer,"keycard_shell_module");
     }
 
     #[test]

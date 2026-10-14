@@ -135,8 +135,13 @@ const SIGNER_TIMEOUT: Duration = Duration::from_secs(20);
 const INFO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A signer module over IPC, through the `signer` interface bound to its name.
+type OriginSnapshots = Arc<std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>>;
+
 struct IpcSigner {
     name: String,
+    peer: Option<String>,
+    routed: std::collections::BTreeMap<String, serde_json::Value>,
+    origins: OriginSnapshots,
 }
 
 fn unavailable(name: &str, e: impl std::fmt::Display) -> SignerError {
@@ -164,15 +169,36 @@ impl Signer for IpcSigner {
         let reply = signer::SignerClient::bind(&self.name)
             .signer_accounts_with_timeout(SIGNER_TIMEOUT)
             .map_err(|e| unavailable(&self.name, e))?;
-        signer_json::read_accounts(&reply)
+        let mut snapshot: serde_json::Value = serde_json::from_str(&reply).map_err(|e| unavailable(&self.name, e))?;
+        if let Some(peer) = &self.peer {
+            let other = signer::SignerClient::bind(peer).signer_accounts_with_timeout(INFO_TIMEOUT)
+                .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(serde_json::Value::Null);
+            snapshot = crate::keycard_routes::inventory(snapshot, &other);
+        }
+        self.routed.clear();
+        if crate::keycard_routes::peer(&self.name).is_some() {
+            for row in snapshot["accounts"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(offer)) = (row["id"].as_str(), row.get("keycardAccount").filter(|v| v.is_object())) {
+                    self.routed.insert(id.to_lowercase(), offer.clone());
+                }
+            }
+        }
+        let accounts = signer_json::read_accounts(&snapshot.to_string())?;
+        self.origins.lock().unwrap_or_else(|e| e.into_inner()).insert(self.name.clone(), snapshot);
+        Ok(accounts)
     }
 
     fn sign(&mut self, request: SignRequest) -> logos_signer_interface::Result<String> {
-        let body = Zeroizing::new(serde_json::to_string(&request).map_err(|e| unavailable(&self.name, e))?);
-        drop(request);
+        let offer = self.routed.get(&request.account.to_lowercase()).cloned();
+        let mut value = serde_json::to_value(request).map_err(|e| unavailable(&self.name, e))?;
+        if let Some(offer) = offer { value["keycardAccount"] = offer; }
+        let body = Zeroizing::new(value.to_string());
+        if let Some(serde_json::Value::String(secret)) = value.get_mut("secret") {
+            zeroize::Zeroize::zeroize(secret);
+        }
+        drop(value);
         let reply = signer::SignerClient::bind(&self.name)
-            .sign_with_timeout(&body, SIGNER_TIMEOUT)
-            .map_err(|e| unavailable(&self.name, e))?;
+            .sign_with_timeout(&body, SIGNER_TIMEOUT).map_err(|e| unavailable(&self.name, e))?;
         signer_json::read_job(&reply)
     }
 
@@ -288,6 +314,7 @@ struct Core {
     unattended: Vec<Unattended>,
     roles: gate::Roles,
     signers: Registry,
+    origins: OriginSnapshots,
     /// The signers whose accounts changed, named by their listeners.
     stale: Arc<std::sync::Mutex<Vec<String>>>,
     started: bool,
@@ -358,7 +385,9 @@ impl Core {
     fn bind_signers(&mut self) {
         let mut r = Registry::new();
         for name in &self.roles.signers {
-            r.add(name.clone(), Box::new(IpcSigner { name: name.clone() }));
+            r.add(name.clone(), Box::new(IpcSigner { name: name.clone(), origins: self.origins.clone(),
+                peer: crate::keycard_routes::peer(name).filter(|p| self.roles.signers.iter().any(|n| n == p)).map(str::to_owned),
+                routed: Default::default() }));
             let mut client = signer::SignerClient::bind(name);
             if let Ok(sub) = client.on_signer_accounts_changed() {
                 let (stale, me, name) = (self.stale.clone(), self.me.clone(), name.clone());
@@ -387,7 +416,12 @@ impl Core {
         if !self.started {
             self.bind_signers();
         }
-        let changed = std::mem::take(&mut *self.stale.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut changed = std::mem::take(&mut *self.stale.lock().unwrap_or_else(|e| e.into_inner()));
+        if changed.iter().any(|name| crate::keycard_routes::peer(name).is_some()) {
+            for name in ["keycard_module", "keycard_shell_module"] {
+                if !changed.iter().any(|n| n == name) { changed.push(name.into()); }
+            }
+        }
         if !changed.is_empty() {
             // Only the signers that announced: a module that isn't installed keeps resting.
             self.signers.forget(&changed);
@@ -835,7 +869,11 @@ impl Core {
                         "signer": signer, "available": a.available })
             })
             .collect();
-        json!({ "ok": true, "accounts": list }).to_string()
+        let mut inventory = json!({ "ok": true, "accounts": list });
+        for (provider, snapshot) in self.origins.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            crate::origins::attach(&mut inventory, provider, snapshot);
+        }
+        inventory.to_string()
     }
 
     fn signers(&mut self) -> String {

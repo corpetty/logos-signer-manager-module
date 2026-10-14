@@ -41,12 +41,18 @@ fn same_id(a: &Account, id: &str) -> bool {
     }
 }
 
+// A reader reports its current seed; USB presence alone cannot identify a Shell's card.
+fn preferred(name: &str, a: &Account, old_name: &str, old: &Account) -> bool {
+    (a.available && !old.available)
+        || (a.available && old.available && name == "keycard_module" && old_name == "keycard_shell_module")
+}
+
 impl Registry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Signers are consulted in the order added: when two offer the same account, the first holds it.
+    /// Signers are consulted in the order added: available signers take priority; a matching reader precedes a candidate Shell.
     pub fn add(&mut self, name: impl Into<String>, signer: Box<dyn Signer + Send>) {
         self.entries.push(Entry { name: name.into(), signer, info: None, accounts: None, missed: None });
     }
@@ -89,13 +95,15 @@ impl Registry {
     }
 
     fn lookup(&self, id: &str) -> Option<Found> {
+        let mut first = None;
         for (i, e) in self.entries.iter().enumerate() {
             let (Some(info), Some(accounts)) = (&e.info, &e.accounts) else { continue };
             if let Some(a) = accounts.iter().find(|a| same_id(a, id)) {
-                return Some(Found { signer: i, name: e.name.clone(), info: info.clone(), account: a.clone() });
+                let found = Found { signer: i, name: e.name.clone(), info: info.clone(), account: a.clone() };
+                if first.as_ref().is_none_or(|old: &Found| preferred(&e.name, a, &old.name, &old.account)) { first = Some(found); }
             }
         }
-        None
+        first
     }
 
     /// The account `id` and its signer, reading the signers again once if it isn't known.
@@ -113,16 +121,16 @@ impl Registry {
         self.lookup(id).ok_or_else(|| ManagerError::NotFound(format!("no signer offers the account {}", id.trim())))
     }
 
-    /// Every account, each under the first signer that offers it.
+    /// Every account once, under its preferred available signer.
     pub fn accounts(&mut self) -> Vec<(String, Account)> {
         let mut out: Vec<(String, Account)> = Vec::new();
         for i in 0..self.entries.len() {
             self.load(i);
             let e = &self.entries[i];
             for a in e.accounts.iter().flatten() {
-                if !out.iter().any(|(_, seen)| same_id(seen, &a.id)) {
-                    out.push((e.name.clone(), a.clone()));
-                }
+                if let Some(index) = out.iter().position(|(_, seen)| same_id(seen, &a.id)) {
+                    if preferred(&e.name, a, &out[index].0, &out[index].1) { out[index] = (e.name.clone(), a.clone()); }
+                } else { out.push((e.name.clone(), a.clone())); }
             }
         }
         out
