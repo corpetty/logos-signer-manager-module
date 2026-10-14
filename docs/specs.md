@@ -67,8 +67,10 @@ is never a named module.
 keystore's: a role or list the document doesn't name is held by nobody, and a malformed document
 changes nothing. `signers` lists the signer modules consulted, in order; when two offer the same
 account, the first holds it. Defaults: approver `evm_signer_ui`, custodian `evm_keystore_ui`
-(for the open and unlock requests to come), signers `keystore_module`, `keycard_shell_module` and
-`keycard_module`, so a device module the person installs is consulted with nothing to configure.
+(for the open and unlock requests to come), signers `keystore_module`, `keycard_shell_module`,
+`keycard_module` and `qr_signer_module`, so a device module the person installs is consulted with
+nothing to configure. The QR signer comes last: a Keycard Shell's account offered both over USB and
+over QR codes is signed over USB while the Shell's USB module offers it.
 A signer that doesn't answer, such as a device module that isn't installed, offers nothing and
 rests for 30 seconds. Each ask costs the transport about a second to find no module, and longer on
 a loaded machine, so a resting signer isn't asked again before then, unless it announces itself
