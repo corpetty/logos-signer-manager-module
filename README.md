@@ -17,8 +17,8 @@ byte what the keystore returned when it signed itself.
 
 `accounts` lists every signer's accounts, without xpubs. `signers` says which signer modules are
 consulted. `configure` names the approvers, the custodians and the signers. Unconfigured, it consults
-the keystore, then the Keycard Shell's and the Keycard's modules when they are installed. Those two
-are optional dependencies, so installed ones load with the manager.
+the keystore, then the Keycard Shell's, the Keycard's and the QR signer's modules when they are
+installed. Those three are optional dependencies, so installed ones load with the manager.
 
 See [`docs/specs.md`](docs/specs.md) for the reference, and
 [`doctests/signer-manager-runtime.test.yaml`](doctests/signer-manager-runtime.test.yaml) for the
