@@ -136,6 +136,21 @@ mod tests {
     }
 
     #[test]
+    fn every_default_signer_loads_with_the_manager_when_installed() {
+        // A default signer outside metadata.json loads only once something else loads it.
+        let meta: serde_json::Value = serde_json::from_str(include_str!("../../metadata.json")).unwrap();
+        let declared = |key: &str| -> Vec<String> {
+            let entries = meta[key].as_array().cloned().unwrap_or_default();
+            entries.iter().filter_map(|d| d.as_str().or(d["name"].as_str()).map(String::from)).collect()
+        };
+        let (required, optional) = (declared("dependencies"), declared("optional_dependencies"));
+        for signer in DEFAULT_SIGNERS {
+            assert!(required.iter().chain(&optional).any(|d| d == signer), "{signer} is not a dependency");
+        }
+        assert!(optional.iter().all(|d| !required.contains(d)), "a dependency is one kind or the other");
+    }
+
+    #[test]
     fn configuring_is_total_and_a_malformed_document_changes_nothing() {
         let mut r = Roles::default();
         r.configure(r#"{"approvers":["evm_signer_ui","evm_signer_cli"],"signers":["keystore_module","ledger_module"]}"#).unwrap();
