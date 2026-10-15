@@ -84,11 +84,16 @@ sections:
         code_block: "logoscore -D -m ./modules > logs.txt &"
       - run: "sleep 3"
       - title: "Load the probe, which loads the manager and the keystore"
+        text: |
+          The Keycard modules are the manager's optional dependencies: installed ones load with it.
+          Neither is installed here, so the load reports both as skipped and succeeds without them.
         run: "./logos/bin/logoscore load-module manager_probe"
         code_block: "logoscore load-module manager_probe"
         expect_contains:
           - "signer_manager_module"
           - "keystore_module"
+          - '{"module":"keycard_module","named_by":"signer_manager_module","reason":"not_installed"}'
+          - '{"module":"keycard_shell_module","named_by":"signer_manager_module","reason":"not_installed"}'
       - title: "Unconfigured, the keystore and the Keycard modules"
         text: |
           With nothing configured, the manager consults the keystore, then the Keycard Shell's and the

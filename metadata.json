@@ -9,6 +9,7 @@
   "category": "wallet",
   "main": "signer_manager_module_plugin",
   "dependencies": ["keystore_module"],
+  "optional_dependencies": ["keycard_module", "keycard_shell_module"],
   "interface_dependencies": [
     { "name": "signer", "input": "logos-signer-interface", "file": "signer.lidl" }
   ],
