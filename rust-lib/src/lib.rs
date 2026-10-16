@@ -13,6 +13,7 @@ pub mod evm;
 pub mod gate;
 pub mod psbt;
 pub mod registry;
+pub mod roster;
 pub mod origins;
 
 #[cfg(feature = "logos_module")]

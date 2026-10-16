@@ -38,15 +38,28 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     fn ack_result(&self, handle: String, receipt: String) -> bool;
     /// The requester gave up; a signer still working is told to stop.
     fn cancel_approval(&self, handle: String, receipt: String) -> bool;
+    /// Every account once, with every signer that holds it, ranked: `{ ok, accounts: [{ key,
+    /// family, chain?, address?, path?, label?, labels?, wallet?: { fingerprint?, name? }, holders:
+    /// [{ signer, accountId, kind, model, transport, presence, available, collects, showsRequest,
+    /// requestKinds }] }] }`. No xpub.
+    fn roster(&self) -> String;
 
     // ── Tier A: the configured approver only ────────────────────────────
     /// Queue summaries, never leg detail: `{ ok, pending: [{ handle, requester, state, purpose,
     /// legs, ageMs, error? }] }`.
     fn pending(&self) -> String;
     /// Claim a request for display: `{ ok, handle, bundle_id, requester, claim_lines,
-    /// render_lines, signer, collects, account, unlocked }`. `collects` says what `approve` must carry,
-    /// unless `unlocked`, when an unlock covers the request and no password is needed.
+    /// render_lines, signer, collects, account, unlocked, signers, explicit }`. `collects` says what
+    /// `approve` must carry, unless `unlocked`, when an unlock covers the request and no password is
+    /// needed. `signers` are every holder of the account, ranked, as `{ signer, accountId, kind,
+    /// model, transport, presence, available, collects, showsRequest, canTake, why? }`; `signer` is
+    /// the one it goes to, chosen by the person when `explicit`.
     fn acknowledge(&self, handle: String) -> String;
+    /// The person chose which holder signs the request on screen: the `acknowledge` reply for it.
+    /// The request and its commitment don't change.
+    fn choose_signer(&self, handle: String, bundle_id: String, signer: String) -> String;
+    /// The `acknowledge` reply again, as the holders stand now: after a signer's accounts change.
+    fn approval_signers(&self, handle: String) -> String;
     /// The person said yes: `{ ok, signed_count }` once signed, or `{ ok, state: "signing" }` while a
     /// device works. A wrong password answers `{ ok: false, code: "wrong_secret" }` and the request
     /// stays on screen. `password` is the vault password or a card's PIN, or empty.
@@ -96,8 +109,8 @@ pub trait SignerManagerModule: Send + Sync + 'static {
 
     // ── Tier C: ungated reads ───────────────────────────────────────────
     /// Every signer's accounts, each under the first signer that offers it: `{ ok, accounts: [{
-    /// id, family, chain?, address?, label?, signer, available }] }`. No xpub: it would show a
-    /// Bitcoin wallet's whole history to anyone who asked.
+    /// id, key, family, chain?, address?, label?, signer, available }] }`. No xpub: it would show a
+    /// Bitcoin wallet's whole history to anyone who asked. `key` is the account's `roster` key.
     fn accounts(&self) -> String;
     /// The signer modules consulted, with what each says it is: `{ ok, signers: [{ name, info? }] }`.
     fn signers(&self) -> String;
@@ -260,6 +273,13 @@ impl KeyHolder for KeystoreKeys {
         Ok(opened_wallet(&keystore_reply(modules().keystore_module.device_database_key(&body))?))
     }
 
+    fn device_wallets(&mut self) -> crate::Result<Vec<(String, String)>> {
+        let v = keystore_reply(modules().keystore_module.device_wallets())?;
+        Ok(v.get("wallets").and_then(|w| w.as_array()).into_iter().flatten().filter_map(|w| {
+            Some((w.get("signer")?.as_str()?.to_string(), w.get("account")?.as_str()?.to_string()))
+        }).collect())
+    }
+
     fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> crate::Result<Unlocked> {
         let body = Zeroizing::new(
             json!({ "account": account, "password": password, "ttlMs": ttl_ms, "count": count }).to_string(),
@@ -335,7 +355,7 @@ fn err(e: impl std::fmt::Display) -> String {
 
 /// A refusal carries the signer's code, so the approver can tell "try the password again".
 fn manager_err(e: &ManagerError) -> String {
-    match e.code() {
+    match e.wire_code() {
         Some(code) => json!({ "ok": false, "code": code, "error": e.to_string() }).to_string(),
         None => err(e),
     }
@@ -576,14 +596,41 @@ impl Core {
             return not_authorized();
         }
         self.refresh();
-        match self.approvals.acknowledge(&mut self.signers, &handle) {
-            // `unlocked`: an unlock covers this request, so `approve` needs no password.
-            Ok(v) => json!({ "ok": true, "handle": v.handle, "bundle_id": v.bundle_id, "requester": v.requester,
-                             "claim_lines": v.claim_lines, "render_lines": v.render_lines,
-                             "signer": v.signer, "collects": v.collects, "account": v.account,
-                             "unlocked": self.cover(&handle) != Cover::No })
-            .to_string(),
-            Err(e) => err(e),
+        let shown = self.approvals.acknowledge(&mut self.signers, &handle);
+        self.shown(&handle, shown)
+    }
+
+    fn choose_signer(&mut self, handle: String, bundle_id: String, signer: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        self.refresh();
+        let shown = self.approvals.choose(&mut self.signers, &handle, &bundle_id, &signer);
+        self.shown(&handle, shown)
+    }
+
+    fn approval_signers(&mut self, handle: String) -> String {
+        if !self.is_approver() {
+            return not_authorized();
+        }
+        self.refresh();
+        let shown = self.approvals.signers_for(&mut self.signers, &handle);
+        self.shown(&handle, shown)
+    }
+
+    /// The approver's view of a request. `unlocked`: an unlock covers it, so `approve` needs no
+    /// password; only the keystore's copy of an account is ever unlocked.
+    fn shown(&mut self, handle: &str, shown: crate::Result<crate::approval::Rendered>) -> String {
+        match shown {
+            Ok(v) => {
+                let unlocked = v.signer == crate::roster::KEYSTORE && self.cover(handle) != Cover::No;
+                json!({ "ok": true, "handle": v.handle, "bundle_id": v.bundle_id, "requester": v.requester,
+                        "claim_lines": v.claim_lines, "render_lines": v.render_lines,
+                        "signer": v.signer, "collects": v.collects, "account": v.account,
+                        "unlocked": unlocked, "signers": v.signers, "explicit": v.explicit })
+                .to_string()
+            }
+            Err(e) => manager_err(&e),
         }
     }
 
@@ -593,8 +640,8 @@ impl Core {
             return not_authorized();
         }
         self.refresh();
-        let cover = self.cover(&handle);
-        let unlocked = cover != Cover::No;
+        let keystore = self.approvals.signer_of(&handle).as_deref() == Some(crate::roster::KEYSTORE);
+        let unlocked = keystore && self.cover(&handle) != Cover::No;
         match self.approvals.approve(&mut self.signers, &handle, &bundle_id, &password, unlocked) {
             Ok(Approved::Settled(n)) => {
                 emit_approval_settled(&handle, "approved");
@@ -865,8 +912,8 @@ impl Core {
             .accounts()
             .into_iter()
             .map(|(signer, a)| {
-                json!({ "id": a.id, "family": a.family, "chain": a.chain, "address": a.address, "label": a.label,
-                        "signer": signer, "available": a.available })
+                json!({ "id": a.id, "key": crate::roster::key_of(&a), "family": a.family, "chain": a.chain,
+                        "address": a.address, "label": a.label, "signer": signer, "available": a.available })
             })
             .collect();
         let mut inventory = json!({ "ok": true, "accounts": list });
@@ -874,6 +921,22 @@ impl Core {
             crate::origins::attach(&mut inventory, provider, snapshot);
         }
         inventory.to_string()
+    }
+
+    fn roster(&mut self) -> String {
+        if self.named_caller().is_none() {
+            return not_authorized();
+        }
+        self.refresh();
+        let roster = self.signers.roster();
+        let snapshots = self.origins.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let list: Vec<_> = roster
+            .iter()
+            .map(|(key, holders)| {
+                crate::roster::entry_json(key, holders, |f| crate::origins::of(&snapshots, &f.name, &f.account))
+            })
+            .collect();
+        json!({ "ok": true, "accounts": list }).to_string()
     }
 
     fn signers(&mut self) -> String {
@@ -942,6 +1005,18 @@ impl SignerManagerModule for SignerManagerModuleImpl {
 
     fn acknowledge(&self, handle: String) -> String {
         self.core().acknowledge(handle)
+    }
+
+    fn choose_signer(&self, handle: String, bundle_id: String, signer: String) -> String {
+        self.core().choose_signer(handle, bundle_id, signer)
+    }
+
+    fn approval_signers(&self, handle: String) -> String {
+        self.core().approval_signers(handle)
+    }
+
+    fn roster(&self) -> String {
+        self.core().roster()
     }
 
     fn approve(&self, handle: String, bundle_id: String, password: String) -> String {

@@ -462,6 +462,78 @@ sections:
         expect_contains:
           - '\"code\":\"wrong_secret\"'
           - "the same database key"
+
+  - title: "One account, two signers"
+    step: true
+    text: |
+      The keystore now takes the device's phrase too, so both hold `0x9858…aEda94`. The manager
+      lists that account once, with both holders: the keystore first, then the device. A request
+      goes to the keystore unless the person chooses the device. The request and its commitment
+      stay the same either way, so nothing needs reviewing again.
+    steps:
+      - title: "The keystore holds the device's account too"
+        run: |
+          ./logos/bin/logoscore call manager_probe import_phrase '{"phrase":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about","accountIndex":0,"password":"pw"}'
+          for i in $(seq 1 20); do
+            ./logos/bin/logoscore call manager_probe roster > roster.json
+            python3 -c 'import json,sys; r = json.loads(json.load(open("roster.json"))["result"]); e = [a for a in r["accounts"] if a["key"] == sys.argv[1]]; print("holders:", [(h["signer"], h["transport"], h["presence"]) for h in e[0]["holders"]] if e else [])' 0x9858effd232b4033e47d90003d41ec34ecaeda94 > holders.txt
+            grep -q keystore_module holders.txt && break; sleep 0.5
+          done
+          cat holders.txt
+        code_block: |
+          logoscore call manager_probe import_phrase '{"phrase":"abandon … about","accountIndex":0,"password":"pw"}'
+          logoscore call manager_probe roster              # one entry, both holders, ranked
+        expect_contains:
+          - "holders: [('keystore_module', 'keystore', 'local'), ('mock_device_signer', 'other', 'connected')]"
+      - title: "The approver is offered both, and chooses the device"
+        run: |
+          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test, two signers","legs":[{"kind":"message","text":"two signers"}]}' > mreq.json
+          python3 -c 'import json; r = json.loads(json.load(open("mreq.json"))["result"]); open("mhandle", "w").write(r["handle"]); open("mreceipt", "w").write(r["receipt"])'
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat mhandle)" > mshown.json
+          python3 -c 'import json; r = json.loads(json.load(open("mshown.json"))["result"]); open("mbundle", "w").write(r["bundle_id"]); print("default:", r["signer"], "explicit:", r["explicit"], "offered:", [c["signer"] for c in r["signers"]])'
+          ./logos/bin/logoscore call manager_probe choose "$(cat mhandle)" "$(cat mbundle)" mock_device_signer > mchosen.json
+          python3 -c 'import json; r = json.loads(json.load(open("mchosen.json"))["result"]); print("chosen:", r["signer"], "explicit:", r["explicit"], "collects:", r["collects"], "same commitment:", r["bundle_id"] == open("mbundle").read())'
+        code_block: |
+          logoscore call manager_probe acknowledge <handle>                           # signer: keystore_module, signers: [keystore, device]
+          logoscore call manager_probe choose <handle> <bundle_id> mock_device_signer  # the same bundle_id
+        expect_contains:
+          - "default: keystore_module explicit: False offered: ['keystore_module', 'mock_device_signer']"
+          - "chosen: mock_device_signer explicit: True collects: nothing same commitment: True"
+      - title: "Unplugged, the choice says so, and the request stays on screen"
+        run: |
+          ./logos/bin/logoscore call manager_probe heard > /dev/null
+          ./logos/bin/logoscore call mock_device_signer plug false
+          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard | grep -q accounts_changed && break; sleep 0.5; done
+          ./logos/bin/logoscore call manager_probe approve "$(cat mhandle)" "$(cat mbundle)" ""
+          ./logos/bin/logoscore call manager_probe status "$(cat mhandle)" "$(cat mreceipt)"
+        code_block: |
+          logoscore call mock_device_signer plug false
+          logoscore call manager_probe approve <handle> <bundle_id> ""    # unavailable
+          logoscore call manager_probe status <handle> <receipt>          # rendered
+        expect_contains:
+          - '\"code\":\"unavailable\"'
+          - "connect it or choose another signer"
+          - '\"state\":\"rendered\"'
+      - title: "Plugged back in, the device signs it"
+        run: |
+          ./logos/bin/logoscore call manager_probe heard > /dev/null
+          ./logos/bin/logoscore call mock_device_signer plug true
+          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe heard | grep -q accounts_changed && break; sleep 0.5; done
+          ./logos/bin/logoscore call manager_probe approve "$(cat mhandle)" "$(cat mbundle)" ""
+          ./logos/bin/logoscore call mock_device_signer screen > mscreen.json
+          ./logos/bin/logoscore call mock_device_signer press "$(python3 -c 'import json; print(json.loads(json.load(open("mscreen.json"))["result"])["waiting"][0]["job"])')" confirm
+          for i in $(seq 1 20); do ./logos/bin/logoscore call manager_probe status "$(cat mhandle)" "$(cat mreceipt)" > mstatus.json; grep -q settled mstatus.json && break; sleep 0.5; done
+          cat mstatus.json
+          ./logos/bin/logoscore call manager_probe fetch "$(cat mhandle)" "$(cat mreceipt)"
+        code_block: |
+          logoscore call mock_device_signer plug true
+          logoscore call manager_probe approve <handle> <bundle_id> ""    # signing, on the device
+          logoscore call mock_device_signer press <job> confirm
+          logoscore call manager_probe fetch <handle> <receipt>
+        expect_contains:
+          - '\"state\":\"signing\"'
+          - '\"reason\":\"approved\"'
+          - '\"signed\":[\"0x'
   - title: "Stop"
     step: true
     steps:

@@ -20,7 +20,7 @@ use logos_signer_interface::Family;
 use crate::btc::AccountPublic;
 use crate::error::{bad, ManagerError, Result};
 use crate::evm::check_displayable;
-use crate::registry::Registry;
+use crate::registry::{Found, Registry};
 
 pub const MAX_PENDING_PER_REQUESTER: usize = 2;
 pub const SETTLED_RETENTION: Duration = Duration::from_secs(120);
@@ -35,8 +35,8 @@ pub struct OpenedWallet {
     pub birthday: Option<String>,
 }
 
-/// The signer whose Bitcoin wallets keep their database key in their own vault; any other is a device.
-const KEYSTORE: &str = "keystore_module";
+// The signer whose Bitcoin wallets keep their database key in their own vault; any other is a device.
+use crate::roster::KEYSTORE;
 
 /// What the keystore does for an open or an unlock, beyond the signer interface.
 pub trait KeyHolder {
@@ -44,6 +44,8 @@ pub trait KeyHolder {
     /// A device account's database key, made at its first open under the password the person set.
     fn device_database_key(&mut self, signer: &str, account: &str, password: &str, birthday: Option<&str>)
         -> Result<OpenedWallet>;
+    /// The device wallets that have a database key, as `(signer, account)`.
+    fn device_wallets(&mut self) -> Result<Vec<(String, String)>>;
     fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> Result<Unlocked>;
     fn lock(&mut self, account: Option<&str>) -> Result<usize>;
     fn unlocked(&mut self) -> Result<Vec<Unlocked>>;
@@ -473,7 +475,8 @@ impl Access {
                 }
                 let terms = if on_device { None } else { decision.unlock.or_else(|| p.unlock.clone()) };
                 let opened = if on_device {
-                    keys.device_database_key(&found.name, &found.account.id, &password, decision.birthday.as_deref())?
+                    let (signer, account) = database_holder(signers, keys, &found)?;
+                    keys.device_database_key(&signer, &account, &password, decision.birthday.as_deref())?
                 } else {
                     keys.database_key(&group, Some(&password))?
                 };
@@ -635,6 +638,22 @@ impl Access {
     }
 }
 
+/// Whose name a device wallet's database key is kept under: the holder that already has one,
+/// else the first in configured order. So reopening it through the Shell instead of the reader
+/// finds the same key, and the wallet's database with it.
+fn database_holder(signers: &mut Registry, keys: &mut dyn KeyHolder, found: &Found) -> Result<(String, String)> {
+    let mut holders: Vec<Found> =
+        signers.holders(&found.account.id)?.into_iter().filter(|f| f.name != KEYSTORE).collect();
+    holders.sort_by_key(|f| f.signer);
+    let kept = keys.device_wallets()?;
+    let pick = holders
+        .iter()
+        .find(|f| kept.iter().any(|(s, a)| *s == f.name && *a == f.account.id))
+        .or(holders.first())
+        .unwrap_or(found);
+    Ok((pick.name.clone(), pick.account.id.clone()))
+}
+
 fn scope_for(account: &str, terms: &Terms, requester: &str) -> Scope {
     let apps = if terms.apps.is_empty() { vec![requester.to_string()] } else { terms.apps.clone() };
     Scope { account: lower(account), apps, confirm: terms.confirm }
@@ -680,6 +699,9 @@ pub(crate) mod tests {
                 )));
             }
             Ok(OpenedWallet { database_key: Zeroizing::new(key.clone()), origin: "restored".into(), birthday: day.clone() })
+        }
+        fn device_wallets(&mut self) -> Result<Vec<(String, String)>> {
+            Ok(self.devices.keys().cloned().collect())
         }
         fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> Result<Unlocked> {
             self.database_key(account, Some(password))?;
@@ -769,6 +791,23 @@ pub(crate) mod tests {
         // And an unlock is refused before anything is shown.
         let unlock = r#"{"account":"mock-segwit","ttlMs":60000}"#;
         assert!(a.request_unlock(&mut s, "bitcoin_wallet_core_module", unlock).is_err());
+    }
+
+    #[test]
+    fn a_device_wallet_keeps_its_database_key_whichever_transport_opens_it() {
+        let mut s = Registry::new();
+        s.add("keycard_module", Box::new(MockSigner::new(MockOptions::default())));
+        s.add("keycard_shell_module", Box::new(MockSigner::new(MockOptions::default())));
+        let (mut k, mut a) = (FakeKeys::default(), Access::new());
+        // First opened through the Shell; now the card is in a reader, which is preferred.
+        let shell = ("keycard_shell_module".to_string(), "mock-segwit".to_string());
+        k.devices.insert(shell.clone(), ("data-pw".into(), "cd".repeat(32), None));
+        assert_eq!(s.find("mock-segwit").unwrap().name, "keycard_module");
+        let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"group":"mock-segwit"}"#).unwrap();
+        let bundle = a.acknowledge(&h).unwrap().bundle_id;
+        a.approve(&mut s, &mut k, &h, &bundle, decide(None, "data-pw", None)).unwrap();
+        assert_eq!(a.fetch(&h, &r).unwrap()["databaseKey"].as_str(), Some("cd".repeat(32).as_str()));
+        assert_eq!(k.devices.keys().collect::<Vec<_>>(), vec![&shell], "no second key, no second database");
     }
 
     #[test]

@@ -18,10 +18,34 @@ pub fn attach(inventory: &mut Value, provider: &str, source: &Value) {
     }
 }
 
+/// The `origin` a signer's last listing gave one of its accounts.
+pub fn of(snapshots: &std::collections::BTreeMap<String, Value>, signer: &str, account: &logos_signer_interface::Account) -> Option<Value> {
+    let evm = account.family == logos_signer_interface::Family::Evm;
+    snapshots.get(signer)?["accounts"]
+        .as_array()?
+        .iter()
+        .find(|a| a["id"].as_str().is_some_and(|id| if evm { id.eq_ignore_ascii_case(&account.id) } else { id == account.id }))?
+        .get("origin")
+        .filter(|o| o.is_object())
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_origin_is_read_off_the_signer_that_listed_the_account() {
+        let snapshots = [("keycard_module".to_string(), json!({"accounts":[
+            {"id":"0xab","family":"evm","origin":{"phrase":{"name":"Main"}}}]}))].into_iter().collect();
+        let mut a: logos_signer_interface::Account = serde_json::from_value(json!({
+            "id":"0xAB","family":"evm","address":"0xAB","available":true})).unwrap();
+        assert_eq!(of(&snapshots, "keycard_module", &a).unwrap()["phrase"]["name"], "Main");
+        assert!(of(&snapshots, "keystore_module", &a).is_none());
+        a.id = "0xcd".into();
+        assert!(of(&snapshots, "keycard_module", &a).is_none());
+    }
     #[test]
     fn origin_follows_selected_provider_not_duplicate_address() {
         let mut inventory = json!({"accounts":[{"id":"0xAb", "family":"evm", "signer":"keystore_module"}]});
