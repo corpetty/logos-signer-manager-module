@@ -26,6 +26,7 @@ use crate::error::{bad, ManagerError, Result};
 use crate::evm::{self, check_displayable, parse_u128, ParsedTx, UnsignedTx};
 use crate::psbt::{self as btcpsbt, Checked};
 use crate::registry::{Found, Registry};
+use crate::roster::{self, Presence, Transport, KEYSTORE};
 
 /// Garbage collection for an offer whose requester will never come back; the requester cancels
 /// promptly when its own path closes, so this only covers its death.
@@ -117,8 +118,13 @@ struct Record {
     bundle_id: [u8; 32],
     claim_lines: Vec<String>,
     render_lines: Vec<String>,
+    /// The roster key of the account: any signer holding it may sign.
+    key: String,
+    /// The signer the person chose, if they chose one.
+    chosen: Option<String>,
+    /// The signer it goes to: the one chosen, else the default when last shown.
     signer: String,
-    /// The account's id at its signer, for the unlock that may cover it.
+    /// The account's id at that signer, for the unlock that may cover it.
     account: String,
     state: State,
     offered_at: Instant,
@@ -164,6 +170,96 @@ pub struct Rendered {
     pub collects: logos_signer_interface::Collects,
     /// The account at its signer: an address, or a Bitcoin wallet's id. What an unlock names.
     pub account: String,
+    /// Every signer holding the account, ranked, for the person to choose from.
+    pub signers: Vec<Choice>,
+    /// Whether the person chose `signer`, rather than it being the default.
+    pub explicit: bool,
+}
+
+/// A signer holding a request's account, as the approver offers it.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Choice {
+    pub signer: String,
+    pub account_id: String,
+    pub kind: String,
+    pub model: String,
+    pub transport: Transport,
+    pub presence: Presence,
+    pub available: bool,
+    pub collects: logos_signer_interface::Collects,
+    pub shows_request: bool,
+    /// Whether it can sign this request at all, connected or not.
+    pub can_take: bool,
+    /// Why it can't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+/// A holder, and what it would make of the request.
+struct Candidate {
+    choice: Choice,
+    found: Found,
+    refusal: Option<ManagerError>,
+}
+
+/// Every holder of the request's account, ranked, each checked against the request.
+fn candidates(signers: &mut Registry, intent: &Intent, key: &str) -> Result<Vec<Candidate>> {
+    let mut out = Vec::new();
+    for found in signers.holders(key)? {
+        let refusal = prepare_on(signers, intent, Some(found.clone()))
+            .and_then(|p| kind_for(intent, &p, &found.info).map(drop))
+            .err();
+        let choice = Choice {
+            signer: found.name.clone(),
+            account_id: found.account.id.clone(),
+            kind: found.info.kind.clone(),
+            model: found.info.model.clone(),
+            transport: roster::transport(&found),
+            presence: roster::presence(&found),
+            available: found.account.available,
+            collects: found.info.collects,
+            shows_request: found.info.shows_request,
+            can_take: refusal.is_none(),
+            why: refusal.as_ref().map(|e| e.to_string()),
+        };
+        out.push(Candidate { choice, found, refusal });
+    }
+    Ok(out)
+}
+
+/// The holder a request goes to unless the person chooses: the first ready one that can take
+/// it, else the first that can once connected.
+fn default_of(cands: &[Candidate]) -> Option<usize> {
+    cands
+        .iter()
+        .position(|c| c.choice.can_take && c.choice.presence != Presence::Absent)
+        .or_else(|| cands.iter().position(|c| c.choice.can_take))
+}
+
+/// Why no holder can take it: the first one's reason.
+fn refused(mut cands: Vec<Candidate>) -> ManagerError {
+    match cands.first_mut().and_then(|c| c.refusal.take()) {
+        Some(e) => e,
+        None => bad("no signer holds this account"),
+    }
+}
+
+fn not_connected(found: &Found) -> ManagerError {
+    logos_signer_interface::SignerError::new(
+        logos_signer_interface::ErrorCode::Unavailable,
+        format!("{} isn't connected: connect it or choose another signer", roster::device_name(found)),
+    )
+    .into()
+}
+
+/// The account an intent names, before anything else is read.
+fn named(intent: &Intent) -> Result<String> {
+    let bitcoin = !intent.group.trim().is_empty();
+    if bitcoin == !intent.address.trim().is_empty() {
+        return Err(bad("intent: name exactly one of address (EVM) or group (Bitcoin)"));
+    }
+    Ok(if bitcoin { intent.group.trim().to_string() } else { format!("{}", evm::parse_address(&intent.address)?) })
 }
 
 pub struct Summary {
@@ -247,9 +343,12 @@ impl Approvals {
         }
         check_displayable(&intent.purpose, "purpose")?;
 
-        let prepared = prepare(signers, &intent)?;
-        // A request its signer can't take is refused here, before anyone is shown it.
-        kind_for(&intent, &prepared, &prepared.found().info)?;
+        // Refused here, before anyone is shown it, only when no holder can take it.
+        let mut cands = candidates(signers, &intent, &named(&intent)?)?;
+        let Some(pick) = default_of(&cands) else { return Err(refused(cands)) };
+        let found = cands.swap_remove(pick).found;
+        let key = roster::key_of(&found.account).unwrap_or_else(|| found.account.id.clone());
+        let prepared = prepare_on(signers, &intent, Some(found))?;
         let bundle_id = commitment(&intent, &prepared)?;
         let (claim_lines, render_lines) = render(&intent, &prepared, &bundle_id)?;
 
@@ -264,6 +363,8 @@ impl Approvals {
             bundle_id,
             claim_lines,
             render_lines,
+            key,
+            chosen: None,
             signer: prepared.found().name.clone(),
             account: prepared.found().account.id.clone(),
             state: State::Offered,
@@ -316,25 +417,75 @@ impl Approvals {
                 r.claimed = true;
             }
         }
-        let prepared = prepare(signers, &r.intent)?;
-        kind_for(&r.intent, &prepared, &prepared.found().info)?;
-        r.signer = prepared.found().name.clone();
-        let (handle, bundle_id, requester, claim_lines, render_lines, signer, account) = (
-            r.handle.clone(),
-            hex::encode(r.bundle_id),
-            r.requester.clone(),
-            r.claim_lines.clone(),
-            r.render_lines.clone(),
-            r.signer.clone(),
-            r.account.clone(),
-        );
-        let collects = signers
-            .infos()
-            .into_iter()
-            .find(|(n, _)| *n == signer)
-            .and_then(|(_, i)| i)
-            .map_or(logos_signer_interface::Collects::Nothing, |i| i.collects);
-        Ok(Rendered { handle, bundle_id, requester, claim_lines, render_lines, signer, collects, account })
+        self.view(signers, handle)
+    }
+
+    /// The person chose which holder signs; the choice stands until they choose again. The request
+    /// and its commitment don't change, so nothing needs reviewing again.
+    pub fn choose(&mut self, signers: &mut Registry, handle: &str, bundle_id_echo: &str, signer: &str) -> Result<Rendered> {
+        self.sweep();
+        let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
+        if r.state != State::Rendered {
+            return Err(bad("choose_signer: this handle was not the one being rendered"));
+        }
+        if bundle_id_echo.trim().trim_start_matches("0x") != hex::encode(r.bundle_id) {
+            return Err(bad("choose_signer: bundle_id does not match the rendered request"));
+        }
+        let mut cands = candidates(signers, &r.intent, &r.key)?;
+        let Some(i) = cands.iter().position(|c| c.found.name == signer) else {
+            return Err(ManagerError::NotFound(format!("{signer} does not hold this account")));
+        };
+        if let Some(e) = cands[i].refusal.take() {
+            return Err(e);
+        }
+        r.chosen = Some(signer.to_string());
+        r.last_error = None;
+        self.view(signers, handle)
+    }
+
+    /// The signers a shown request may go to, as they stand now: after a signer's accounts change.
+    pub fn signers_for(&mut self, signers: &mut Registry, handle: &str) -> Result<Rendered> {
+        let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
+        if r.state != State::Rendered {
+            return Err(bad("approval_signers: this handle is not the one being rendered"));
+        }
+        self.view(signers, handle)
+    }
+
+    /// The record as the approver shows it, going to the holder chosen, else to the default now.
+    fn view(&mut self, signers: &mut Registry, handle: &str) -> Result<Rendered> {
+        let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
+        let cands = candidates(signers, &r.intent, &r.key)?;
+        // A choice that no longer holds the account, or can't take it, gives way to the default.
+        if r.chosen.as_ref().is_some_and(|name| !cands.iter().any(|c| &c.found.name == name && c.choice.can_take)) {
+            r.chosen = None;
+        }
+        let pick = match &r.chosen {
+            Some(name) => cands.iter().position(|c| &c.found.name == name),
+            None => default_of(&cands),
+        };
+        let Some(pick) = pick else { return Err(refused(cands)) };
+        let found = &cands[pick].found;
+        r.signer = found.name.clone();
+        r.account = found.account.id.clone();
+        let collects = found.info.collects;
+        Ok(Rendered {
+            handle: r.handle.clone(),
+            bundle_id: hex::encode(r.bundle_id),
+            requester: r.requester.clone(),
+            claim_lines: r.claim_lines.clone(),
+            render_lines: r.render_lines.clone(),
+            signer: r.signer.clone(),
+            collects,
+            account: r.account.clone(),
+            signers: cands.into_iter().map(|c| c.choice).collect(),
+            explicit: r.chosen.is_some(),
+        })
+    }
+
+    /// The signer a request goes to, as last shown.
+    pub fn signer_of(&self, handle: &str) -> Option<String> {
+        self.records.iter().find(|r| r.handle == handle).map(|r| r.signer.clone())
     }
 
     /// Who asked, and for which account: what an unlock's scope is checked against.
@@ -372,7 +523,31 @@ impl Approvals {
 
     fn sign(&mut self, signers: &mut Registry, handle: &str, echo: Option<&str>, secret: &str, unlocked: bool) -> Result<Approved> {
         let r = self.find(handle).ok_or_else(|| ManagerError::NotFound(handle.to_string()))?;
-        let prepared = prepare(signers, &r.intent)?;
+        let mut cands = candidates(signers, &r.intent, &r.key)?;
+        // Unshown, only the keystore signs, inside its unlock; shown, the holder the person chose,
+        // else the default they were shown.
+        let pick = match (echo, &r.chosen) {
+            (None, _) => cands
+                .iter()
+                .position(|c| c.found.name == KEYSTORE && c.choice.can_take)
+                .ok_or_else(|| bad("only the keystore signs without asking"))?,
+            (Some(_), Some(name)) => cands.iter().position(|c| &c.found.name == name).ok_or_else(|| {
+                ManagerError::from(logos_signer_interface::SignerError::new(
+                    logos_signer_interface::ErrorCode::Unavailable,
+                    format!("{name} no longer offers this account: choose another signer"),
+                ))
+            })?,
+            (Some(_), None) => match default_of(&cands) {
+                Some(i) => i,
+                None => return Err(refused(cands)),
+            },
+        };
+        let Candidate { found, refusal, choice } = cands.swap_remove(pick);
+        if let Some(e) = refusal {
+            r.last_error = Some(e.to_string());
+            return Err(e);
+        }
+        let prepared = prepare_on(signers, &r.intent, Some(found.clone()))?;
         let fresh = commitment(&r.intent, &prepared)?;
         if fresh != r.bundle_id {
             return Err(bad("approve: commitment drift"));
@@ -380,12 +555,20 @@ impl Approvals {
         if echo.is_some_and(|e| e.trim().trim_start_matches("0x") != hex::encode(fresh)) {
             return Err(bad("approve: bundle_id does not match the rendered request"));
         }
-        let found = prepared.found().clone();
-        if echo.is_some() && found.name != r.signer {
-            r.state = State::Offered;
-            r.last_error = Some("Signing connection changed. Review the request again for the current connection.".into());
-            return Err(bad(r.last_error.clone().unwrap()));
+        // The default moved since the person saw it: they see the new one before it signs.
+        if echo.is_some() && r.chosen.is_none() && found.name != r.signer {
+            let msg = format!("The signer changed to {}: review it, then approve again", roster::device_name(&found));
+            (r.signer, r.account) = (found.name.clone(), found.account.id.clone());
+            r.last_error = Some(msg.clone());
+            return Err(ManagerError::SignerChanged(msg));
         }
+        if choice.presence == Presence::Absent {
+            let e = not_connected(&found);
+            r.last_error = Some(e.to_string());
+            return Err(e);
+        }
+        // An unlock is the keystore's: it covers no other holder of the same address.
+        let unlocked = unlocked && found.name == KEYSTORE;
         if secret.is_empty() && !unlocked && found.info.collects != logos_signer_interface::Collects::Nothing {
             let e = logos_signer_interface::SignerError::new(
                 logos_signer_interface::ErrorCode::Locked,
@@ -558,10 +741,8 @@ fn evm_only() -> ManagerError {
     bad("intent: a psbt leg needs a Bitcoin group, not an address")
 }
 
-/// Check the intent's shape, find the account's signer, and read a Bitcoin request's PSBT.
-fn prepare(signers: &mut Registry, intent: &Intent) -> Result<Prepared> {
-    prepare_on(signers, intent, None)
-}
+/// Check the intent's shape, find the account's signer unless pinned, and read a Bitcoin
+/// request's PSBT.
 fn prepare_on(signers: &mut Registry, intent: &Intent, pinned: Option<Found>) -> Result<Prepared> {
     let bitcoin = !intent.group.trim().is_empty();
     if bitcoin == !intent.address.trim().is_empty() {
@@ -1390,6 +1571,7 @@ mod tests {
     impl Switchable {
         fn new() -> Self { Self { device: Device::whole(), connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) } }
         fn unplug(&self) { self.connected.store(false, std::sync::atomic::Ordering::SeqCst); }
+        fn plug(&self) { self.connected.store(true, std::sync::atomic::Ordering::SeqCst); }
     }
     impl Signer for Switchable {
         fn info(&self) -> SignerInfo { self.device.info() }
@@ -1435,12 +1617,17 @@ mod tests {
     fn changing_connection_after_display_requires_review_before_signing() {
         let reader=Switchable::new(); let shell=Switchable::new(); let mut s=Registry::new();
         s.add("keycard_module",Box::new(reader.clone())); s.add("keycard_shell_module",Box::new(shell.clone()));
-        let mut ap=Approvals::new(); let (h,_)=ap.request(&mut s,"x",&message_intent("route review")).unwrap();
+        let mut ap=Approvals::new(); let (h,r)=ap.request(&mut s,"x",&message_intent("route review")).unwrap();
         let v=ap.acknowledge(&mut s,&h).unwrap();
+        assert_eq!(v.signer, "keycard_module");
         reader.unplug(); s.forget(&["keycard_module".into()]);
-        assert!(ap.approve(&mut s,&h,&v.bundle_id,"",false).unwrap_err().to_string().contains("connection changed"));
-        assert!(shell.device.0.lock().unwrap().waiting().is_empty());
-        assert_eq!(ap.acknowledge(&mut s,&h).unwrap().signer,"keycard_shell_module");
+        let e = ap.approve(&mut s,&h,&v.bundle_id,"",false).unwrap_err();
+        assert_eq!(e.wire_code().as_deref(), Some("signer_changed"), "{e}");
+        assert!(shell.device.0.lock().unwrap().waiting().is_empty(), "nothing signed unseen");
+        assert_eq!(ap.status(&mut s,&h,&r).unwrap().0, "rendered", "still on screen");
+        assert_eq!(ap.signers_for(&mut s,&h).unwrap().signer, "keycard_shell_module");
+        assert_eq!(ap.approve(&mut s,&h,&v.bundle_id,"",false).unwrap(), Approved::Signing);
+        assert_eq!(shell.device.0.lock().unwrap().waiting().len(), 1);
     }
 
     #[test]
@@ -1652,6 +1839,147 @@ mod tests {
         ap.cancel(&mut s, &h, &r).unwrap();
         assert_eq!(s.signer(0).status(&job).unwrap().state, JobState::Cancelled);
     }
+    /// The keystore and a Keycard holding the same phrase: one account, two holders.
+    fn two_holders() -> (Registry, Switchable) {
+        let mut s = Registry::new();
+        s.add("keystore_module", Box::new(MockSigner::new(MockOptions {
+            collects: Collects::Password, secret: "pw".into(), kind: "keystore".into(), ..Default::default()
+        })));
+        let card = Switchable::new();
+        s.add("keycard_module", Box::new(card.clone()));
+        (s, card)
+    }
+
+    #[test]
+    fn a_request_offers_every_holder_and_goes_to_the_keystore_unless_chosen() {
+        let (mut s, _card) = two_holders();
+        let mut ap = Approvals::new();
+        let (h, _) = ap.request(&mut s, "wallet", &tx_intent("0x1")).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        assert_eq!((v.signer.as_str(), v.explicit), ("keystore_module", false));
+        let order: Vec<_> = v.signers.iter().map(|c| (c.signer.as_str(), c.transport, c.presence)).collect();
+        assert_eq!(order, vec![
+            ("keystore_module", Transport::Keystore, Presence::Local),
+            ("keycard_module", Transport::Reader, Presence::Connected),
+        ]);
+        assert!(v.signers.iter().all(|c| c.can_take && c.why.is_none()));
+    }
+
+    #[test]
+    fn the_person_chooses_another_holder_and_the_request_stays_the_same() {
+        let (mut s, card) = two_holders();
+        let mut ap = Approvals::new();
+        let (h, r) = ap.request(&mut s, "wallet", &tx_intent("0x1")).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        assert!(ap.choose(&mut s, &h, &"00".repeat(32), "keycard_module").is_err(), "only for what is shown");
+        assert!(ap.choose(&mut s, &h, &v.bundle_id, "nobody").is_err());
+        let chosen = ap.choose(&mut s, &h, &v.bundle_id, "keycard_module").unwrap();
+        assert_eq!((chosen.signer.as_str(), chosen.explicit, chosen.collects), ("keycard_module", true, Collects::Nothing));
+        assert_eq!((&chosen.bundle_id, &chosen.render_lines), (&v.bundle_id, &v.render_lines));
+        assert_eq!(ap.acknowledge(&mut s, &h).unwrap().signer, "keycard_module", "the choice stands");
+        assert_eq!(ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap(), Approved::Signing);
+        let (job, _) = card.device.showing();
+        card.device.press(&job, true);
+        assert_eq!(ap.status(&mut s, &h, &r).unwrap(), ("settled", Some("approved")));
+        assert_eq!(ap.fetch_result(&mut s, &h, &r).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unplugged_choice_says_so_and_the_request_stays_on_screen() {
+        let (mut s, card) = two_holders();
+        let mut ap = Approvals::new();
+        let (h, r) = ap.request(&mut s, "wallet", &message_intent("unplugged")).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        ap.choose(&mut s, &h, &v.bundle_id, "keycard_module").unwrap();
+        card.unplug();
+        s.forget(&["keycard_module".into()]);
+        let shown = ap.signers_for(&mut s, &h).unwrap();
+        assert_eq!(shown.signer, "keycard_module", "a choice outlasts an unplug");
+        assert_eq!(shown.signers[1].presence, Presence::Absent);
+        let e = ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap_err();
+        assert_eq!(e.code(), Some(ErrorCode::Unavailable), "{e}");
+        assert!(e.to_string().contains("isn't connected"), "{e}");
+        assert_eq!(ap.status(&mut s, &h, &r).unwrap().0, "rendered");
+        card.plug();
+        s.forget(&["keycard_module".into()]);
+        assert_eq!(ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap(), Approved::Signing);
+    }
+
+    #[test]
+    fn a_holder_that_cannot_take_the_request_is_offered_but_not_chosen() {
+        let (mut s, _card) = two_holders();
+        let mut ap = Approvals::new();
+        let digest = format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"digest","digest":"0x{}","purpose":"login"}}]}}"#, "11".repeat(32));
+        let (h, _) = ap.request(&mut s, "wallet", &digest).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        let card = v.signers.iter().find(|c| c.signer == "keycard_module").unwrap();
+        assert!(!card.can_take && card.why.as_deref().unwrap().contains("bare digest"), "{card:?}");
+        assert!(ap.choose(&mut s, &h, &v.bundle_id, "keycard_module").is_err());
+        assert_eq!(ap.acknowledge(&mut s, &h).unwrap().signer, "keystore_module");
+    }
+
+    #[test]
+    fn only_the_keystore_signs_without_asking() {
+        let card = Switchable::new();
+        let mut s = Registry::new();
+        s.add("keycard_module", Box::new(card.clone()));
+        s.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
+        let mut ap = Approvals::new();
+        let (h, _) = ap.request(&mut s, "game", &message_intent("unattended")).unwrap();
+        assert_eq!(ap.sign_unattended(&mut s, &h).unwrap(), Approved::Settled(1));
+        assert!(card.device.0.lock().unwrap().waiting().is_empty());
+        let mut alone = Registry::new();
+        alone.add("keycard_module", Box::new(card.clone()));
+        let (h, _) = ap.request(&mut alone, "game", &message_intent("no keystore")).unwrap();
+        assert!(ap.sign_unattended(&mut alone, &h).is_err());
+        assert!(card.device.0.lock().unwrap().waiting().is_empty());
+    }
+
+    /// A device that names its Bitcoin accounts its own way, as a Keycard does.
+    struct Renamed(Switchable);
+    const RENAMED: &str = "keycard-";
+    impl Signer for Renamed {
+        fn info(&self) -> SignerInfo { self.0.info() }
+        fn accounts(&mut self) -> logos_signer_interface::Result<Vec<logos_signer_interface::Account>> {
+            let mut accounts = self.0.accounts()?;
+            for a in accounts.iter_mut().filter(|a| a.family != logos_signer_interface::Family::Evm) {
+                a.id = format!("{RENAMED}{}", a.id);
+            }
+            Ok(accounts)
+        }
+        fn sign(&mut self, mut r: SignRequest) -> logos_signer_interface::Result<String> {
+            let Some(own) = r.account.strip_prefix(RENAMED) else {
+                return Err(logos_signer_interface::SignerError::new(ErrorCode::UnknownAccount, r.account));
+            };
+            r.account = own.to_string();
+            self.0.sign(r)
+        }
+        fn status(&mut self, j: &str) -> logos_signer_interface::Result<JobStatus> { self.0.status(j) }
+        fn result(&mut self, j: &str) -> logos_signer_interface::Result<Vec<Signature>> { self.0.result(j) }
+        fn cancel(&mut self, j: &str) -> logos_signer_interface::Result<()> { self.0.cancel(j) }
+    }
+
+    #[test]
+    fn a_bitcoin_request_opened_under_one_holder_is_signed_by_another() {
+        let (_, listed, acct) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
+        let (mut s, _) = fixture();
+        let card = Switchable::new();
+        s.add("keycard_module", Box::new(Renamed(card.clone())));
+        let mut ap = Approvals::new();
+        let psbt = crate::psbt::tests::sample(&acct);
+        let (h, r) = ap.request(&mut s, "bitcoin_wallet_core_module", &psbt_intent(&listed.id, &psbt)).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        let theirs = v.signers.iter().find(|c| c.signer == "keycard_module").unwrap();
+        assert_eq!(theirs.account_id, format!("{RENAMED}{}", listed.id), "the card's own id");
+        ap.choose(&mut s, &h, &v.bundle_id, "keycard_module").unwrap();
+        assert_eq!(ap.approve(&mut s, &h, &v.bundle_id, "", false).unwrap(), Approved::Signing);
+        let (job, payload) = card.device.showing();
+        assert!(matches!(payload, Payload::BtcPsbt { .. }));
+        card.device.press(&job, true);
+        let signed: Psbt = ap.fetch_result(&mut s, &h, &r).unwrap().remove(0).parse().unwrap();
+        assert_eq!(signed.unsigned_tx, psbt.unsigned_tx);
+        assert!(signed.inputs.iter().all(|i| !i.partial_sigs.is_empty()));
+    }
 }
 
 #[cfg(test)]
@@ -1699,4 +2027,5 @@ mod unlock_tests {
         ap.acknowledge(&mut s, &h2).unwrap();
         assert!(ap.sign_unattended(&mut s, &h2).is_err(), "a request on screen waits for the person");
     }
+
 }

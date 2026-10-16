@@ -16,6 +16,9 @@ pub enum ManagerError {
     Signer(SignerError),
     #[error("signing error: {0}")]
     Signing(String),
+    /// The signer a request would use changed after the person saw it: they review it again.
+    #[error("{0}")]
+    SignerChanged(String),
 }
 
 impl ManagerError {
@@ -24,6 +27,14 @@ impl ManagerError {
         match self {
             ManagerError::Signer(e) => Some(e.code),
             _ => None,
+        }
+    }
+
+    /// The code a reply carries: the signer's, or the manager's own `signer_changed`.
+    pub fn wire_code(&self) -> Option<String> {
+        match self {
+            ManagerError::SignerChanged(_) => Some("signer_changed".into()),
+            _ => self.code().and_then(|c| serde_json::to_value(c).ok()?.as_str().map(str::to_string)),
         }
     }
 }

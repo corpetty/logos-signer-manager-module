@@ -13,7 +13,7 @@ resolver = "3"
 [dependencies]
 signer_manager_module = { path = "../../rust-lib", default-features = false }
 # The signer: the interface's mock, keyed from the keystore harness's test phrase.
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "0c927c3326ac2774dff68f1a4b1a6dd0503949e0", features = ["mock"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "75be729e5f4c7560488ec1d96c538392d7a659a9", features = ["mock"] }
 bdk_wallet = "3.2.0"
 ureq = { version = "2", default-features = false }
 serde_json = "1"

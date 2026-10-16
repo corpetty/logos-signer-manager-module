@@ -18,7 +18,7 @@ crate-type = ["staticlib", "rlib"]
 alloy = { version = "1", default-features = false, features = ["std", "consensus", "eips", "rlp", "dyn-abi", "eip712"] }
 # Bitcoin: PSBTs, sighashes, keys below an account's xpub. The plugin's export list keeps libsecp256k1 in.
 bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64"] }
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "0c927c3326ac2774dff68f1a4b1a6dd0503949e0" }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "75be729e5f4c7560488ec1d96c538392d7a659a9" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -31,7 +31,7 @@ zeroize = "1"
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
 
 [dev-dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "0c927c3326ac2774dff68f1a4b1a6dd0503949e0", features = ["mock", "conformance"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "75be729e5f4c7560488ec1d96c538392d7a659a9", features = ["mock", "conformance"] }
 bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "std"] }
 alloy = { version = "1", default-features = false, features = ["std", "consensus", "eips", "signers", "signer-local"] }
 
