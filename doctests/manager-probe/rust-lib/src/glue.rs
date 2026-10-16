@@ -8,6 +8,12 @@ pub trait ManagerProbeModule: Send + 'static {
     fn import_key(&mut self, priv_hex: String, password: String) -> String;
     /// Make a Bitcoin wallet in the keystore, as its custodian: `import_bitcoin`'s params.
     fn import_bitcoin(&mut self, params_json: String) -> String;
+    /// Derive an EVM account from a phrase into the keystore, as its custodian: `import_mnemonic`'s params.
+    fn import_phrase(&mut self, params_json: String) -> String;
+    /// Every account with every signer holding it, as a named module reads it.
+    fn roster(&mut self) -> String;
+    /// The approver chose which holder signs a request on screen.
+    fn choose(&mut self, handle: String, bundle_id: String, signer: String) -> String;
     /// Ask the manager for a signature, as a requester: `{ ok, handle, receipt, state }`.
     fn request(&mut self, intent_json: String) -> String;
     fn status(&mut self, handle: String, receipt: String) -> String;
@@ -57,6 +63,18 @@ impl ManagerProbeModule for ManagerProbeModuleImpl {
 
     fn import_bitcoin(&mut self, params_json: String) -> String {
         pass(modules().keystore_module.import_bitcoin(&params_json))
+    }
+
+    fn import_phrase(&mut self, params_json: String) -> String {
+        pass(modules().keystore_module.import_mnemonic(&params_json))
+    }
+
+    fn roster(&mut self) -> String {
+        pass(modules().signer_manager_module.roster())
+    }
+
+    fn choose(&mut self, handle: String, bundle_id: String, signer: String) -> String {
+        pass(modules().signer_manager_module.choose_signer(&handle, &bundle_id, &signer))
     }
 
     fn request(&mut self, intent_json: String) -> String {

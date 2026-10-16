@@ -10,12 +10,15 @@ the account's public material before anyone can collect a result.
 The approval API is `keystore_module`'s, with the same names and shapes:
 - **Requesters**, any named module: `request_approval`, `approval_status`, `fetch_result`,
   `ack_result` and `cancel_approval`.
-- **The approver**, the signer app: `pending`, `acknowledge`, `approve` and `reject`.
+- **The approver**, the signer app: `pending`, `acknowledge`, `approve` and `reject`, and
+  `choose_signer` and `approval_signers` to pick which signer holding the account signs.
 
 A requester or an approver moving here changes only the module it calls. The results are byte for
 byte what the keystore returned when it signed itself.
 
-`accounts` lists every signer's accounts, without xpubs. `signers` says which signer modules are
+`accounts` lists every signer's accounts, without xpubs, each under one holder. `roster` lists each
+account once with every signer that holds it, ranked: the keystore, connected devices, QR wallets,
+then unplugged devices. Apps pick accounts from it. `signers` says which signer modules are
 consulted. `configure` names the approvers, the custodians and the signers. Unconfigured, it consults
 the keystore, then the Keycard Shell's and the Keycard's modules when they are installed. Those two
 are optional dependencies, so installed ones load with the manager.

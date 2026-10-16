@@ -17,12 +17,14 @@ requester or an approver changes only the module it calls.
 ## How a request moves
 
 1. A named module calls `request_approval` with an intent and gets a handle and a receipt.
-   The manager parses the intent once, finds the signer that offers the account, and for a
-   Bitcoin request reads the PSBT against the wallet's xpub. A request it would not sign is
+   The manager parses the intent once, finds every signer that holds the account, and for a
+   Bitcoin request reads the PSBT against the wallet's xpub. A request no holder can take is
    refused here, before anything is shown.
 2. The approver (the signer app, `evm_signer_ui`) calls `pending` and `acknowledge`. It gets
    the manager's own lines, the requester's claim apart from them, the commitment to echo
-   back, the signer's name, and what that signer collects: a password, a PIN, or nothing.
+   back, the signer it goes to and what that signer collects: a password, a PIN, or nothing.
+   It also gets every signer holding the account, so the person can choose another with
+   `choose_signer` (see [One account, several signers](#one-account-several-signers)).
    `unlocked` says an unlock covers the request, so the person approves without a password.
 3. The person approves. `approve` re-derives the commitment and checks the echo. It then
    computes one digest per item and calls the signer's `sign`, passing the password only
@@ -50,8 +52,9 @@ stays in `signing`, and each later call checks how the job stands:
 
 | Tier | Methods | Admits |
 |---|---|---|
-| A | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
+| A | `pending`, `acknowledge`, `choose_signer`, `approval_signers`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | B | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; all but the first also need the receipt |
+| B | `roster` | any **named module** |
 | C | `accounts`, `signers`, `caller_identity`, and for now `configure` | anyone |
 | B | `request_open`, `request_unlock` | any **named module**, collecting with `fetch_result` and its receipt |
 | D | `access_requests`, `acknowledge_access`, `approve_access`, `reject_access`, `open_accounts`, `unlock`, `lock` | a configured **custodian** (default `evm_keystore_ui`, the keys app) |
@@ -65,8 +68,9 @@ is never a named module.
 
 `{ approvers?, custodians?, signers? }` → `{ ok, approvers, custodians, signers }`. Total, as the
 keystore's: a role or list the document doesn't name is held by nobody, and a malformed document
-changes nothing. `signers` lists the signer modules consulted, in order; when two offer the same
-account, the first holds it. Defaults: approver `evm_signer_ui`, custodian `evm_keystore_ui`
+changes nothing. `signers` lists the signer modules consulted, in order; when several hold the same
+account, that order breaks ties between them (see
+[One account, several signers](#one-account-several-signers)). Defaults: approver `evm_signer_ui`, custodian `evm_keystore_ui`
 (for the open and unlock requests to come), signers `keystore_module`, `keycard_shell_module` and
 `keycard_module`, so a device module the person installs is consulted with nothing to configure.
 A signer that doesn't answer, such as a device module that isn't installed, offers nothing and
@@ -90,10 +94,13 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `ack_result` | `handle, receipt` | `bool` |
 | `cancel_approval` | `handle, receipt` | `bool`; a signer still working is told to stop |
 | `pending` | — | `{ ok, pending: [{ handle, requester, state, purpose, legs, ageMs, error? }] }` |
-| `acknowledge` | `handle` | `{ ok, handle, bundle_id, requester, claim_lines, render_lines, signer, collects, account, unlocked }`; `account` is what an unlock of it names |
+| `acknowledge` | `handle` | `{ ok, handle, bundle_id, requester, claim_lines, render_lines, signer, collects, account, unlocked, signers, explicit }`; `account` is what an unlock of it names |
+| `choose_signer` | `handle, bundle_id, signer` | `acknowledge`'s reply, for the signer chosen |
+| `approval_signers` | `handle` | `acknowledge`'s reply, as the holders stand now |
 | `approve` | `handle, bundle_id, password` | `{ ok, signed_count }`, or `{ ok, state: "signing" }`, or `{ ok: false, code, error }` |
 | `reject` | `handle` | `bool` |
-| `accounts` | — | `{ ok, accounts: [{ id, family, chain?, address?, label?, signer, available }] }` |
+| `accounts` | — | `{ ok, accounts: [{ id, key, family, chain?, address?, label?, signer, available }] }`, each under one holder |
+| `roster` | — | `{ ok, accounts: [{ key, family, chain?, address?, path?, label?, labels?, wallet?, holders }] }`, each with every holder |
 | `signers` | — | `{ ok, signers: [{ name, info? }] }` |
 | `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, signers }`: everything a total `configure` must repeat |
 | `request_open`, `request_unlock` | `params_json` | `{ ok, handle, receipt, state }` |
@@ -110,8 +117,52 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, ageMs }] }` |
 
 `approve`'s `code` is the signer's: `wrong_secret` (ask again), `locked` (no password and no
-unlock), `unavailable` (the signer module didn't answer). `accounts` carries no xpub: a Bitcoin
-wallet's xpub shows its whole history, so the manager does not hand it to whoever asks.
+unlock), `unavailable` (the signer module didn't answer, or the chosen device isn't connected). The
+manager adds its own `signer_changed`: see below. The request stays on screen for all of them.
+`accounts` and `roster` carry no xpub: a Bitcoin wallet's xpub shows its whole history, so the
+manager does not hand it to whoever asks.
+
+## One account, several signers
+
+The same account can be held by several signers: the keystore, a Keycard in a reader, a Keycard
+Shell over USB, a QR wallet. Each names it its own way. An EVM account is its address everywhere,
+but a Bitcoin wallet is `g_…` in the keystore, `keycard-…` on a card and `qr-…` in a QR wallet. The
+manager groups holders by what the account is:
+
+- **The key:** an EVM account's lowercase address; a Bitcoin account's `btc_` and 32 hex of a
+  SHA-256 over its family, chain, chain code and public key. Two xpubs of one key whose metadata
+  differs, such as the parent fingerprint, are one account.
+- **Ranking:** the keystore first; then connected devices, a Keycard reader before a USB device;
+  then QR wallets, which need no connection; then devices that aren't connected. Within each, the
+  configured signer order.
+- **Names:** the first name in configured signer order, with `labels` listing them all when holders
+  disagree. `wallet` is the master fingerprint any holder reports and the first wallet name a
+  holder's `origin` gives.
+
+`roster` lists every account once, with its holders ranked. Each holder is `{ signer, accountId,
+kind, model, transport, presence, available, collects, showsRequest, requestKinds }`, where
+`transport` is `keystore`, `reader`, `usb`, `qr` or `other`, and `presence` is `local`,
+`connected`, `on_demand` (a QR wallet) or `absent`. `accounts` keeps its shape, one holder per
+account, and gains `key`.
+
+A request goes to the first holder that is ready and can take it, unless the person chooses:
+- `acknowledge` lists every holder as `signers`, each with `canTake` and, when it can't, `why`: a
+  bare digest or several legs on a device that shows requests, or a kind it doesn't sign.
+- `choose_signer` picks one that can take it. The choice stands until changed. The request and its
+  commitment don't change, so nothing needs reviewing again.
+- `approval_signers` gives the same reply again after a signer's accounts change, with the default
+  re-picked if nobody chose.
+- At `approve`, a chosen device that isn't connected answers `unavailable`. A default that moved
+  since it was shown answers `signer_changed`, and the next `approve` signs with the new one. The
+  request stays on screen either way.
+
+Only the keystore's copy of an account is ever unlocked. Signing unattended goes to the keystore,
+and approving with no password needs the keystore chosen.
+
+A device's Bitcoin wallet keeps one database key, whichever holder opens it. The keystore keeps it
+under the holder that already has one, else the first device holder in configured order. So
+reopening the wallet through the Shell instead of the reader finds the same key and the same
+database.
 
 ### The intent
 

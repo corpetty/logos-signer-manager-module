@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use logos_signer_interface::{Account, Family, Signer, SignerInfo};
 
 use crate::error::{ManagerError, Result};
+use crate::roster;
 
 /// How long a signer that didn't answer is left alone. A module that isn't installed, such as a
 /// default device module, costs the transport's wait of about a second at each ask.
@@ -121,6 +122,72 @@ impl Registry {
         self.lookup(id).ok_or_else(|| ManagerError::NotFound(format!("no signer offers the account {}", id.trim())))
     }
 
+    /// Every holder of the account an id or roster key names, ranked; empty when none offers it.
+    fn holders_known(&self, id_or_key: &str) -> Vec<Found> {
+        let wanted = id_or_key.trim();
+        let key = self.entries.iter().flat_map(|e| e.accounts.iter().flatten()).find_map(|a| {
+            let key = roster::key_of(a)?;
+            (same_id(a, wanted) || key == wanted.to_ascii_lowercase()).then_some(key)
+        });
+        let Some(key) = key else { return Vec::new() };
+        let mut out = Vec::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            let (Some(info), Some(accounts)) = (&e.info, &e.accounts) else { continue };
+            // One per signer: a signer listing an account twice still signs it one way.
+            if let Some(a) = accounts.iter().find(|a| roster::key_of(a).as_deref() == Some(key.as_str())) {
+                out.push(Found { signer: i, name: e.name.clone(), info: info.clone(), account: a.clone() });
+            }
+        }
+        roster::rank(&mut out);
+        out
+    }
+
+    /// Every signer holding the account `id_or_key` names, ranked, reading the signers again once
+    /// if none is known.
+    pub fn holders(&mut self, id_or_key: &str) -> Result<Vec<Found>> {
+        for i in 0..self.entries.len() {
+            self.load(i);
+        }
+        let found = self.holders_known(id_or_key);
+        if !found.is_empty() {
+            return Ok(found);
+        }
+        self.reread();
+        for i in 0..self.entries.len() {
+            self.load(i);
+        }
+        let found = self.holders_known(id_or_key);
+        if found.is_empty() {
+            return Err(ManagerError::NotFound(format!("no signer offers the account {}", id_or_key.trim())));
+        }
+        Ok(found)
+    }
+
+    /// The account as one signer holds it.
+    pub fn holder(&mut self, id_or_key: &str, signer: &str) -> Result<Found> {
+        self.holders(id_or_key)?
+            .into_iter()
+            .find(|f| f.name == signer)
+            .ok_or_else(|| ManagerError::NotFound(format!("{signer} does not hold the account {}", id_or_key.trim())))
+    }
+
+    /// Every account once, by roster key, with all its holders ranked, in the order first listed.
+    pub fn roster(&mut self) -> Vec<(String, Vec<Found>)> {
+        for i in 0..self.entries.len() {
+            self.load(i);
+        }
+        let mut keys: Vec<String> = Vec::new();
+        for a in self.entries.iter().flat_map(|e| e.accounts.iter().flatten()) {
+            if let Some(key) = roster::key_of(a).filter(|k| !keys.contains(k)) {
+                keys.push(key);
+            }
+        }
+        keys.into_iter().map(|k| {
+            let holders = self.holders_known(&k);
+            (k, holders)
+        }).collect()
+    }
+
     /// Every account once, under its preferred available signer.
     pub fn accounts(&mut self) -> Vec<(String, Account)> {
         let mut out: Vec<(String, Account)> = Vec::new();
@@ -234,5 +301,30 @@ mod tests {
         assert_eq!(r.accounts().len(), 3, "the second signer's copies are not offered twice");
         assert!(r.find("0x0000000000000000000000000000000000000001").is_err());
         assert!(r.find("MOCK-SEGWIT").is_err(), "a Bitcoin id is exact");
+    }
+
+    #[test]
+    fn signers_holding_one_phrase_hold_one_account_each_ranked() {
+        let mock = |kind: &str, available: bool| {
+            Box::new(MockSigner::new(MockOptions { kind: kind.into(), available, ..Default::default() }))
+        };
+        let mut r = Registry::new();
+        r.add("keycard_shell_module", mock("keycard_shell", false));
+        r.add("qr_signer_module", mock("qr", true));
+        r.add("keystore_module", mock("keystore", true));
+        let roster = r.roster();
+        assert_eq!(roster.len(), 3, "its EVM, native segwit and taproot accounts, once each");
+        for (_, holders) in &roster {
+            let names: Vec<_> = holders.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(names, ["keystore_module", "qr_signer_module", "keycard_shell_module"]);
+        }
+        let evm = &roster.iter().find(|(_, h)| h[0].account.family == Family::Evm).unwrap().0;
+        assert_eq!(r.holders("0xF39FD6E51AAD88F6F4CE6AB8827279CFFFB92266").unwrap().len(), 3, "by address");
+        assert_eq!(r.holders(evm).unwrap().len(), 3, "by key");
+        let (segwit, holders) = roster.iter().find(|(_, h)| h[0].account.family == Family::Bitcoin).unwrap();
+        assert_eq!(r.holders(&holders[0].account.id).unwrap().len(), 3, "by any holder's id");
+        assert_eq!(r.holder(segwit, "qr_signer_module").unwrap().name, "qr_signer_module");
+        assert!(r.holder(segwit, "keycard_module").is_err());
+        assert!(r.holders("btc_00").is_err());
     }
 }
