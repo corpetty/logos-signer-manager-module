@@ -23,9 +23,9 @@
       url = "github:logos-co/logos-keycard-shell-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
-    # The QR signer, optional too. Pinned to the module's first branch until it reaches main.
+    # The QR signer, optional too.
     qr_signer_module = {
-      url = "github:logos-co/logos-qr-signer-module/62616c7924a25e596c87d5bb1beee7bfbece28a8";
+      url = "github:logos-co/logos-qr-signer-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
   };

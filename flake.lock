@@ -9684,11 +9684,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792029203,
-        "narHash": "sha256-vdMdj9u413Dc8WOuITdYayHZTDpBwFMm++FlHlXxGrI=",
+        "lastModified": 1792177170,
+        "narHash": "sha256-ttibWHZ59BtWX9ZnAg0UQo9VEb8Z8yV88H4gEESpCRQ=",
         "owner": "logos-co",
         "repo": "logos-qr-scanner-module",
-        "rev": "9984cd5de4d9a0631f2b057f5c8fe1df781cc92c",
+        "rev": "bd5084b7491e3914538099b43d18e7e5e832c771",
         "type": "github"
       },
       "original": {
@@ -9705,17 +9705,16 @@
         "qr_scanner_module": "qr_scanner_module"
       },
       "locked": {
-        "lastModified": 1792077407,
-        "narHash": "sha256-GaYLBHcd1gB1JxuePOJ2Ei9kO1R9g1lhlBeje/b4f2Y=",
+        "lastModified": 1792182734,
+        "narHash": "sha256-l9mL7lrRi7mT3SKNEjGQXy/V0/wFL67TGkkXezRQH0Y=",
         "owner": "logos-co",
         "repo": "logos-qr-signer-module",
-        "rev": "62616c7924a25e596c87d5bb1beee7bfbece28a8",
+        "rev": "33f525fd3bbdf25b8772f0ec0c610a8fab5cf048",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "logos-qr-signer-module",
-        "rev": "62616c7924a25e596c87d5bb1beee7bfbece28a8",
         "type": "github"
       }
     },
