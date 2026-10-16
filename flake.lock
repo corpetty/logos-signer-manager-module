@@ -9676,13 +9676,56 @@
         "type": "github"
       }
     },
+    "qr_scanner_module": {
+      "inputs": {
+        "logos-module-builder": [
+          "qr_signer_module",
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792177170,
+        "narHash": "sha256-ttibWHZ59BtWX9ZnAg0UQo9VEb8Z8yV88H4gEESpCRQ=",
+        "owner": "logos-co",
+        "repo": "logos-qr-scanner-module",
+        "rev": "bd5084b7491e3914538099b43d18e7e5e832c771",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-qr-scanner-module",
+        "type": "github"
+      }
+    },
+    "qr_signer_module": {
+      "inputs": {
+        "logos-module-builder": [
+          "logos-module-builder"
+        ],
+        "qr_scanner_module": "qr_scanner_module"
+      },
+      "locked": {
+        "lastModified": 1792182734,
+        "narHash": "sha256-l9mL7lrRi7mT3SKNEjGQXy/V0/wFL67TGkkXezRQH0Y=",
+        "owner": "logos-co",
+        "repo": "logos-qr-signer-module",
+        "rev": "33f525fd3bbdf25b8772f0ec0c610a8fab5cf048",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-qr-signer-module",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "keycard_module": "keycard_module",
         "keycard_shell_module": "keycard_shell_module",
         "keystore_module": "keystore_module",
         "logos-module-builder": "logos-module-builder",
-        "logos-signer-interface": "logos-signer-interface"
+        "logos-signer-interface": "logos-signer-interface",
+        "qr_signer_module": "qr_signer_module"
       }
     },
     "rust-overlay": {
