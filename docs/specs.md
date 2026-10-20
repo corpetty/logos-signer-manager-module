@@ -58,6 +58,7 @@ stays in `signing`, and each later call checks how the job stands:
 | C | `accounts`, `signers`, `caller_identity`, and for now `configure` | anyone |
 | B | `request_open`, `request_unlock` | any **named module**, collecting with `fetch_result` and its receipt |
 | D | `access_requests`, `acknowledge_access`, `approve_access`, `reject_access`, `open_accounts`, `unlock`, `lock` | a configured **custodian** (default `evm_keystore_ui`, the keys app) |
+| D | `acknowledge_access`, `approve_access`, `access_progress`, `reject_access` | also a holder's **opener**, for an open naming a wallet one of whose holders it opens |
 | — | `account_descriptors`, and `close_account` for one's own wallet | a module the wallet is open for |
 | A and D | `unlocked`, `unattended_signatures` | the approver or the custodian |
 
@@ -66,7 +67,7 @@ is never a named module.
 
 ### `configure(config_json: String) -> String`
 
-`{ approvers?, custodians?, signers? }` → `{ ok, approvers, custodians, signers }`. Total, as the
+`{ approvers?, custodians?, signers?, openers? }` → `{ ok, approvers, custodians, signers, openers }`. Total, as the
 keystore's: a role or list the document doesn't name is held by nobody, and a malformed document
 changes nothing. `signers` lists the signer modules consulted, in order; when several hold the same
 account, that order breaks ties between them (see
@@ -81,6 +82,12 @@ a loaded machine, so a resting signer isn't asked again before then, unless it a
 that its accounts changed. Another signer's announcement, which the keystore makes at every
 import, re-reads that signer alone, and so does looking up an account no signer offers.
 
+`openers` maps each signer to the apps that open its Bitcoin wallets (see
+[Opened by a holder](#opened-by-a-holder)). Defaults: `keystore_module` → `evm_keystore_ui`;
+`keycard_module` → `keycard_ui`; `keycard_shell_module` → `keycard_ui`, `keycard_shell_ui`;
+`qr_signer_module` → `qr_signer_ui`. A command-line module opens wallets only once `configure`
+names it here.
+
 `configure` is ungated for now, like the keystore's, and the keystore's caveat applies: the
 protection is deferred to module identity in the core. A module that names itself a signer can
 refuse or stall a request, but it can't get a false signature past the checks above.
@@ -89,7 +96,7 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 
 | Method | Params | Returns |
 |---|---|---|
-| `configure` | `config_json` | `{ ok, approvers, custodians, signers }` |
+| `configure` | `config_json` | `{ ok, approvers, custodians, signers, openers }` |
 | `request_approval` | `intent_json` | `{ ok, handle, receipt, state }` |
 | `approval_status` | `handle, receipt` | `{ ok, state, reason? }`; `state` is `offered`, `rendered`, `signing` or `settled` |
 | `fetch_result` | `handle, receipt` | `{ ok, signed: [..] }`, idempotent until `ack_result` |
@@ -104,11 +111,12 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `accounts` | — | `{ ok, accounts: [{ id, key, family, chain?, address?, label?, signer, available }] }`, each under one holder |
 | `roster` | — | `{ ok, accounts: [{ key, family, chain?, address?, path?, label?, labels?, wallet?, holders }] }`, each with every holder |
 | `signers` | — | `{ ok, signers: [{ name, info? }] }` |
-| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, signers }`: everything a total `configure` must repeat |
+| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, signers, openers }`: everything a total `configure` must repeat |
 | `request_open`, `request_unlock` | `params_json` | `{ ok, handle, receipt, state }` |
 | `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }` |
-| `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines, asked }` |
-| `approve_access` | `params_json` | `{ ok }`, or `{ ok: false, code, error }` |
+| `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines, asked, holders }` |
+| `approve_access` | `params_json` | `{ ok }`, or `{ ok, state: "opening" }`, or `{ ok: false, code, error }` |
+| `access_progress` | `handle` | `{ ok, state, step?, outcome?, code?, error? }` |
 | `reject_access` | `handle` | `bool` |
 | `account_descriptors` | `group` | `{ ok, group, external, internal }` |
 | `close_account` | `params_json` | `{ ok, closed }` |
@@ -133,7 +141,10 @@ manager groups holders by what the account is:
 
 - **The key:** an EVM account's lowercase address; a Bitcoin account's `btc_` and 32 hex of a
   SHA-256 over its family, chain, chain code and public key. Two xpubs of one key whose metadata
-  differs, such as the parent fingerprint, are one account.
+  differs, such as the parent fingerprint, are one account. A signer that keeps its xpub sealed
+  lists that key as the account's `key`, and the manager uses it.
+- **Guards:** a row under the open keys' purpose (`m/1280263247'`), or an EVM row outside
+  `m/44'/60'`, is dropped from every listing, as an edited file might put one there.
 - **Ranking:** the keystore first; then connected devices, a Keycard reader before a USB device;
   then QR wallets, which need no connection; then devices that aren't connected. Within each, the
   configured signer order.
@@ -142,9 +153,10 @@ manager groups holders by what the account is:
   holder's `origin` gives.
 
 `roster` lists every account once, with its holders ranked. Each holder is `{ signer, accountId,
-kind, model, transport, presence, available, collects, showsRequest, requestKinds }`, where
-`transport` is `keystore`, `reader`, `usb`, `qr` or `other`, and `presence` is `local`,
-`connected`, `on_demand` (a QR wallet) or `absent`. `accounts` keeps its shape, one holder per
+kind, model, transport, presence, available, collects, showsRequest, requestKinds, opens,
+opensByPassword, apps }`, where `transport` is `keystore`, `reader`, `usb`, `qr` or `other`,
+`presence` is `local`, `connected`, `on_demand` (a QR wallet) or `absent`, `opens` says the holder
+gives the wallet's open key, and `apps` are its openers. `accounts` keeps its shape, one holder per
 account, and gains `key`.
 
 A request goes to the first holder that is ready and can take it, unless the person chooses:
@@ -175,6 +187,11 @@ request names `address`; a Bitcoin request names `group` and carries exactly one
 render, the commitment rules and the refusals (displayable text only, declared EIP-712 fields only,
 64 KiB, four pending per requester and sixteen in all, a sixty-second sweep for offers nobody
 claimed) are the keystore's. The commitment's domain tag is now `logos-signer-manager-approval-v1`.
+
+A Bitcoin request may carry `xpub`: the wallet's, from the requester that has it open, for a holder
+that keeps its xpub sealed. The manager refuses it unless it gives the wallet's roster key, uses it
+for this request alone wherever it reads the account (the holders, the PSBT checks, the result),
+passes it to the signer in the `SignRequest`, and forgets it once the request settles.
 
 ### A PSBT
 
@@ -218,7 +235,8 @@ wallet for it in the keys app, and an account stays unlocked only on terms a per
 - `request_unlock` takes `{ account, ttlMs?, count?, apps?, confirm?, reason? }`, the terms an app
   asks for. `fetch_result` returns `{ ok, result: { account, terms, expiresInMs, countLeft } }`:
   the terms the person granted, which may differ.
-- **A device account** is one any signer but the keystore offers. Its database key comes from the
+- **A device account** is one any signer but the keystore offers. Until its signers open it
+  themselves (above), its database key comes from the
   keystore's `device_database_key`, made at the first open under the password the person sets in
   the keys app, with the first day of use they give as `birthday` in `approve_access`. Every later
   open needs that password. A device signs on its own screen, so it has nothing to unlock: terms in
@@ -228,10 +246,27 @@ wallet for it in the keys app, and an account stays unlocked only on terms a per
   that gives one for it is refused.
 - A requester has at most two open or unlock requests pending, and one nobody shows within five
   minutes settles `expired_no_ack`.
+- **Opened by a holder.** An open naming a wallet can be shown and decided by an app the
+  `openers` list for one of its holders, not only by the custodian. The first app to call
+  `acknowledge_access` keeps the request: no other app, the custodian included, can show, decide or
+  reject it after that. `holders` lists the wallet's holders that app may open with.
+  `approve_access` then names one as `signer`, with its PIN or password as `secret` (`password` is
+  the older name), or none for a device that confirms on its screen. The manager asks that holder
+  for the wallet's open key (`wallet_key`), checks the xpub it answers with against the roster key,
+  and settles with the result above plus `signer` and `opensByPassword`; the database key is the
+  one the seed gives, the same from every holder. A holder that answers at once settles the call
+  (`{ ok }`); a wrong secret answers `code: wrong_secret` and leaves the request on screen; one
+  waiting for its person answers `{ ok, state: "opening" }`. `access_progress` then reports
+  `opening` with its `step`, `rendered` with the `code` and `error` that brought it back, or
+  `settled` with its `outcome`, and `access_settled` announces the end. Declined on the device, the
+  open settles `rejected`; cancelled by the requester, the device stops asking. An app the roles
+  don't list for a holder is refused (`not authorized`), and naming no `signer` is the custodian's
+  path alone. Opens that name no wallet, and unlocks, stay with the keys app. The manager keeps
+  neither the open key nor the xpub once the open settles.
 - The custodian (the keys app) works the queue with `access_requests`, `acknowledge_access` (the
   lines to show, the commitment to echo, and `asked`: the wallet or the family and network to pick
-  from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?,
-  password, unlock?, birthday? }`) and `reject_access`. A wrong password answers `code: wrong_secret` and
+  from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?, signer?,
+  secret? | password, unlock?, birthday? }`) and `reject_access`. A wrong password answers `code: wrong_secret` and
   leaves the request on screen. The database key comes from the keystore's `database_key`, the
   unlock from its `unlock`; the manager keeps neither.
 - The keys app also unlocks and locks on its own: `unlock` (`{ account, password, ttlMs?,

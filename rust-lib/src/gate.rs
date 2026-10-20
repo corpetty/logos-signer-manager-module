@@ -8,6 +8,14 @@ pub const DEFAULT_CUSTODIAN: &str = "evm_keystore_ui";
 /// The signer modules consulted, in order, when nothing configures them. A device module that
 /// isn't installed offers nothing (`registry.rs`).
 pub const DEFAULT_SIGNERS: &[&str] = &["keystore_module", "keycard_shell_module", "keycard_module", "qr_signer_module"];
+/// The apps that open each signer's Bitcoin accounts: they show the open request and run the
+/// signer's step, a password, a PIN, a confirmation or QR codes.
+pub const DEFAULT_OPENERS: &[(&str, &[&str])] = &[
+    ("keystore_module", &["evm_keystore_ui"]),
+    ("keycard_shell_module", &["keycard_ui", "keycard_shell_ui"]),
+    ("keycard_module", &["keycard_ui"]),
+    ("qr_signer_module", &["qr_signer_ui"]),
+];
 
 /// Who holds each role, and which signer modules are consulted. A role is a set: a terminal
 /// approver works beside the app rather than displacing it.
@@ -16,6 +24,8 @@ pub struct Roles {
     pub approvers: Vec<String>,
     pub custodians: Vec<String>,
     pub signers: Vec<String>,
+    /// Signer module → the apps that open its accounts.
+    pub openers: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Roles {
@@ -24,6 +34,10 @@ impl Default for Roles {
             approvers: vec![DEFAULT_APPROVER.into()],
             custodians: vec![DEFAULT_CUSTODIAN.into()],
             signers: DEFAULT_SIGNERS.iter().map(|s| s.to_string()).collect(),
+            openers: DEFAULT_OPENERS
+                .iter()
+                .map(|(s, apps)| (s.to_string(), apps.iter().map(|a| a.to_string()).collect()))
+                .collect(),
         }
     }
 }
@@ -68,11 +82,14 @@ struct RolesWire {
     custodians: Names,
     #[serde(default)]
     signers: Names,
+    #[serde(default)]
+    openers: std::collections::BTreeMap<String, Names>,
 }
 
 impl Roles {
-    /// Replace everything from `{ approvers?, custodians?, signers? }`. Total, as the keystore's:
-    /// what the document doesn't name is held by nobody. A malformed document changes nothing.
+    /// Replace everything from `{ approvers?, custodians?, signers?, openers? }`. Total, as the
+    /// keystore's: what the document doesn't name is held by nobody. A malformed document changes
+    /// nothing.
     pub fn configure(&mut self, config_json: &str) -> Result<(), String> {
         let doc: serde_json::Value = serde_json::from_str(config_json).map_err(|e| e.to_string())?;
         if !doc.is_object() {
@@ -82,7 +99,23 @@ impl Roles {
         self.approvers = wire.approvers.into_names();
         self.custodians = wire.custodians.into_names();
         self.signers = wire.signers.into_names();
+        self.openers = wire
+            .openers
+            .into_iter()
+            .map(|(s, apps)| (s.trim().to_string(), apps.into_names()))
+            .filter(|(s, apps)| !s.is_empty() && !apps.is_empty())
+            .collect();
         Ok(())
+    }
+
+    /// May `caller` open the accounts `signer` holds?
+    pub fn opens(&self, caller: &Caller, signer: &str) -> bool {
+        self.openers.get(signer).is_some_and(|apps| holds_any_role(apps, caller))
+    }
+
+    /// The apps that open `signer`'s accounts.
+    pub fn openers_of(&self, signer: &str) -> Vec<String> {
+        self.openers.get(signer).cloned().unwrap_or_default()
     }
 }
 
@@ -165,6 +198,23 @@ mod tests {
             assert!(r.configure(doc).is_err(), "{doc:?}");
             assert_eq!(r, good, "{doc:?}");
         }
+    }
+
+    #[test]
+    fn each_signers_own_apps_open_its_accounts_and_a_cli_only_once_named() {
+        let r = Roles::default();
+        assert!(r.opens(&m("keycard_ui"), "keycard_shell_module"));
+        assert!(r.opens(&m("keycard_shell_ui"), "keycard_shell_module"));
+        assert!(!r.opens(&m("keycard_shell_ui"), "keycard_module"));
+        assert!(r.opens(&m("qr_signer_ui"), "qr_signer_module"));
+        assert!(!r.opens(&m("qr_signer_ui"), "keystore_module"), "an app opens only its own signer's accounts");
+        assert!(!r.opens(&m("evm_signer_cli"), "keycard_module"));
+        let mut cli = Roles::default();
+        cli.configure(r#"{"openers":{"keycard_module":["keycard_ui","evm_signer_cli"],"keystore_module":"evm_keystore_cli"}}"#)
+            .unwrap();
+        assert!(cli.opens(&m("evm_signer_cli"), "keycard_module"));
+        assert!(cli.opens(&m("evm_keystore_cli"), "keystore_module"));
+        assert!(!cli.opens(&m("qr_signer_ui"), "qr_signer_module"), "total: not named, so nobody");
     }
 
     #[test]

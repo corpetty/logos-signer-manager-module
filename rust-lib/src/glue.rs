@@ -11,9 +11,14 @@ use std::time::Duration;
 use serde_json::json;
 use zeroize::Zeroizing;
 
-use logos_signer_interface::{json as signer_json, Account, ErrorCode, JobStatus, SignRequest, Signature, Signer, SignerError, SignerInfo};
+use logos_signer_interface::{
+    json as signer_json, Account, ErrorCode, JobStatus, SignRequest, Signature, Signer, SignerError, SignerInfo, WalletKey,
+    WalletKeyRequest,
+};
 
-use crate::access::{Access, Cover, Decision, KeyHolder, OpenedWallet, Terms, Unlocked};
+use crate::access::{
+    Access, Approved as Opened, Cover, Decision, Gate, KeyHolder, Move as AccessMove, OpenedWallet, Terms, Unlocked,
+};
 use crate::approval::{Approvals, Approved, Move};
 use crate::gate;
 use crate::registry::Registry;
@@ -21,9 +26,10 @@ use crate::ManagerError;
 
 /// The signer manager's IPC contract.
 pub trait SignerManagerModule: Send + Sync + 'static {
-    /// Name the roles and the signer modules consulted: `{ approvers?, custodians?, signers? }` →
-    /// `{ ok, approvers, custodians, signers }`. TOTAL — what the document doesn't name is held by
-    /// nobody — and effective at once. UNGATED for now, as keystore_module's: see docs/specs.md.
+    /// Name the roles and the signer modules consulted: `{ approvers?, custodians?, signers?,
+    /// openers?: { <signer>: [app] } }` → `{ ok, approvers, custodians, signers, openers }`. TOTAL —
+    /// what the document doesn't name is held by nobody — and effective at once. UNGATED for now,
+    /// as keystore_module's: see docs/specs.md.
     fn configure(&self, config_json: String) -> String;
 
     // ── Tier B: any NAMED module may ask ────────────────────────────────
@@ -41,7 +47,8 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// Every account once, with every signer that holds it, ranked: `{ ok, accounts: [{ key,
     /// family, chain?, address?, path?, label?, labels?, wallet?: { fingerprint?, name? }, holders:
     /// [{ signer, accountId, kind, model, transport, presence, available, collects, showsRequest,
-    /// requestKinds }] }] }`. No xpub.
+    /// requestKinds, opens, opensByPassword, apps }] }] }`. No xpub. `apps` open the account
+    /// through that holder; `opens` says the holder gives a Bitcoin account's open key.
     fn roster(&self) -> String;
 
     // ── Tier A: the configured approver only ────────────────────────────
@@ -79,14 +86,21 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     fn request_unlock(&self, params_json: String) -> String;
     /// The custodian's queue: `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }`. Tier D.
     fn access_requests(&self) -> String;
-    /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked }`. `asked` is
-    /// `{ group, family, network, unlock }` for an open and `{ account, terms }` for an unlock. Tier D.
+    /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked, holders }`.
+    /// `asked` is `{ group, family, network, unlock }` for an open and `{ account, terms }` for an
+    /// unlock; `holders` are the wallet's holders the caller opens it with. The custodian, or an app
+    /// that opens one of the wallet's holders (`openers`); the first app to claim it keeps it.
     fn acknowledge_access(&self, handle: String) -> String;
-    /// The person decided: `{ handle, bundle_id, group?, password, unlock?, birthday? }` → `{ ok }`,
-    /// or `{ ok: false, code: "wrong_secret" }` with the request left on screen. For a device
-    /// account the password is its database key's, set at its first open with the `birthday`. Tier D.
+    /// The person decided: `{ handle, bundle_id, group?, signer?, secret?, password?, unlock?,
+    /// birthday? }` → `{ ok }` once open, or `{ ok, state: "opening" }` while the holder works, or
+    /// `{ ok: false, code }` with the request left on screen. With `signer`, that holder works out
+    /// the wallet's open key from its seed (`secret`: its password or PIN, if it takes one). Without
+    /// it, the keystore's own path: its password, or for a device the old data password.
     fn approve_access(&self, params_json: String) -> String;
-    /// The person said no. Tier D.
+    /// How an open stands, for the app that claimed it: `{ ok, state, step?, outcome?, code?,
+    /// error? }`; `step` is `confirm_on_device` while a device waits for its person.
+    fn access_progress(&self, handle: String) -> String;
+    /// The person said no: the custodian, or the app that claimed it.
     fn reject_access(&self, handle: String) -> bool;
     /// An open wallet's descriptors again: `{ ok, group, external, internal }`, only for a module
     /// the wallet is open for.
@@ -115,7 +129,7 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// The signer modules consulted, with what each says it is: `{ ok, signers: [{ name, info? }] }`.
     fn signers(&self) -> String;
     /// What this module sees as its caller, with the roles and signers in force:
-    /// `{ ok, kind, identity, approvers, custodians, signers }`.
+    /// `{ ok, kind, identity, approvers, custodians, signers, openers }`.
     fn caller_identity(&self) -> String;
     /// Framework hook — defaulted, so not part of the IPC contract.
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
@@ -175,6 +189,7 @@ impl Signer for IpcSigner {
                 request_kinds: Vec::new(),
                 shows_request: false,
                 collects: logos_signer_interface::Collects::Nothing,
+                wallet_key: false,
             })
     }
 
@@ -232,6 +247,43 @@ impl Signer for IpcSigner {
     fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
         let reply = signer::SignerClient::bind(&self.name)
             .cancel_sign_with_timeout(job, SIGNER_TIMEOUT)
+            .map_err(|e| unavailable(&self.name, e))?;
+        signer_json::read_job(&reply).map(drop)
+    }
+
+    fn wallet_key(&mut self, request: WalletKeyRequest) -> logos_signer_interface::Result<String> {
+        let offer = self.routed.get(&request.account.to_lowercase()).cloned();
+        let mut value = serde_json::to_value(request).map_err(|e| unavailable(&self.name, e))?;
+        if let Some(offer) = offer { value["keycardAccount"] = offer; }
+        let body = Zeroizing::new(value.to_string());
+        if let Some(serde_json::Value::String(secret)) = value.get_mut("secret") {
+            zeroize::Zeroize::zeroize(secret);
+        }
+        drop(value);
+        let reply = signer::SignerClient::bind(&self.name)
+            .wallet_key_with_timeout(&body, SIGNER_TIMEOUT).map_err(|e| unavailable(&self.name, e))?;
+        signer_json::read_job(&reply)
+    }
+
+    fn wallet_key_status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+        let reply = signer::SignerClient::bind(&self.name)
+            .wallet_key_status_with_timeout(job, SIGNER_TIMEOUT)
+            .map_err(|e| unavailable(&self.name, e))?;
+        signer_json::read_status(&reply)
+    }
+
+    fn wallet_key_result(&mut self, job: &str) -> logos_signer_interface::Result<WalletKey> {
+        let reply = Zeroizing::new(
+            signer::SignerClient::bind(&self.name)
+                .wallet_key_result_with_timeout(job, SIGNER_TIMEOUT)
+                .map_err(|e| unavailable(&self.name, e))?,
+        );
+        signer_json::read_wallet_key(&reply)
+    }
+
+    fn cancel_wallet_key(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+        let reply = signer::SignerClient::bind(&self.name)
+            .cancel_wallet_key_with_timeout(job, SIGNER_TIMEOUT)
             .map_err(|e| unavailable(&self.name, e))?;
         signer_json::read_job(&reply).map(drop)
     }
@@ -455,6 +507,26 @@ impl Core {
                 Move::Rendered(h) => emit_approval_progress(&h, "rendered"),
             }
         }
+        // So does a holder working out an open key; its jobs are announced nowhere, so this looks.
+        self.access.progress(&mut self.signers, &mut KeystoreKeys);
+        self.announce_access();
+    }
+
+    fn announce_access(&mut self) {
+        for m in self.access.drain_moves() {
+            if let AccessMove::Settled(h, o) = m {
+                emit_access_settled(&h, o);
+            }
+        }
+    }
+
+    /// The access gate for the caller: the custodian, or an app that opens some signer's accounts.
+    fn access_caller(&self) -> Option<(String, bool)> {
+        let caller = Self::caller();
+        let name = caller.named()?.to_string();
+        let custodian = self.is_custodian();
+        let opener = self.roles.openers.values().any(|apps| apps.iter().any(|a| a == &name));
+        (custodian || opener).then_some((name, custodian))
     }
 }
 
@@ -470,7 +542,7 @@ impl Core {
             Ok(()) => {
                 self.bind_signers();
                 json!({ "ok": true, "approvers": self.roles.approvers, "custodians": self.roles.custodians,
-                        "signers": self.roles.signers })
+                        "signers": self.roles.signers, "openers": self.roles.openers })
                 .to_string()
             }
             Err(e) => err(e),
@@ -561,7 +633,7 @@ impl Core {
         }
         self.refresh();
         if self.access.owns(&handle) {
-            let ok = self.access.cancel(&handle, &receipt).is_ok();
+            let ok = self.access.cancel(&mut self.signers, &handle, &receipt).is_ok();
             if ok {
                 emit_access_settled(&handle, "cancelled");
             }
@@ -718,22 +790,27 @@ impl Core {
     }
 
     fn acknowledge_access(&mut self, handle: String) -> String {
-        if !self.is_custodian() {
+        let Some((name, custodian)) = self.access_caller() else {
             return not_authorized();
-        }
-        match self.access.acknowledge(&handle) {
+        };
+        self.refresh();
+        let (roles, caller) = (self.roles.clone(), Self::caller());
+        let opens = |signer: &str| roles.opens(&caller, signer);
+        let gate = Gate { caller: &name, custodian, opens: &opens };
+        match self.access.acknowledge(&mut self.signers, &handle, &gate) {
             Ok(v) => json!({ "ok": true, "handle": v.handle, "requester": v.requester, "kind": v.kind,
-                             "bundle_id": v.bundle_id, "lines": v.lines, "asked": v.asked })
+                             "bundle_id": v.bundle_id, "lines": v.lines, "asked": v.asked, "holders": v.holders })
             .to_string(),
+            Err(ManagerError::Refused(_)) | Err(ManagerError::NotFound(_)) => not_authorized(),
             Err(e) => err(e),
         }
     }
 
     fn approve_access(&mut self, params_json: String) -> String {
         let params_json = Zeroizing::new(params_json);
-        if !self.is_custodian() {
+        let Some((name, custodian)) = self.access_caller() else {
             return not_authorized();
-        }
+        };
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
@@ -741,34 +818,71 @@ impl Core {
             bundle_id: String,
             #[serde(default)]
             group: Option<String>,
+            /// The holder that opens it, by its module.
+            #[serde(default)]
+            signer: Option<String>,
+            /// Its password or PIN; `password` is the same, by its older name.
+            #[serde(default)]
+            secret: Option<String>,
+            #[serde(default)]
             password: String,
             #[serde(default)]
             unlock: Option<Terms>,
-            /// A device wallet's first day of use, at its first open.
+            /// A device wallet's first day of use, at its first open (the old data-password path).
             #[serde(default)]
             birthday: Option<String>,
         }
-        let w: Wire = match serde_json::from_str(&params_json) {
+        let mut w: Wire = match serde_json::from_str(&params_json) {
             Ok(w) => w,
             Err(e) => return err(format!("approve_access: {e}")),
         };
-        let birthday = w.birthday.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
-        let decision = Decision { group: w.group, password: w.password, unlock: w.unlock, birthday };
+        let birthday = w.birthday.take().map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+        let password = w.secret.take().unwrap_or_else(|| std::mem::take(&mut w.password));
+        let signer = w.signer.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let decision = Decision { group: w.group.take(), password, unlock: w.unlock.take(), birthday, signer };
         self.refresh();
-        match self.access.approve(&mut self.signers, &mut KeystoreKeys, &w.handle, &w.bundle_id, decision) {
-            Ok(()) => {
+        let (roles, caller) = (self.roles.clone(), Self::caller());
+        let opens = |signer: &str| roles.opens(&caller, signer);
+        let gate = Gate { caller: &name, custodian, opens: &opens };
+        let approved = self.access.approve(&mut self.signers, &mut KeystoreKeys, &w.handle, &w.bundle_id, decision, &gate);
+        self.announce_access();
+        match approved {
+            Ok(Opened::Settled) => {
                 emit_access_settled(&w.handle, "approved");
                 json!({ "ok": true }).to_string()
             }
+            Ok(Opened::Opening) => json!({ "ok": true, "state": "opening" }).to_string(),
+            Err(ManagerError::Refused(why)) if why == "not authorized" => not_authorized(),
             Err(e) => manager_err(&e),
         }
     }
 
-    fn reject_access(&mut self, handle: String) -> bool {
-        if !self.is_custodian() {
-            return false;
+    fn access_progress(&mut self, handle: String) -> String {
+        let Some((name, custodian)) = self.access_caller() else {
+            return not_authorized();
+        };
+        self.refresh();
+        let (roles, caller) = (self.roles.clone(), Self::caller());
+        let opens = |signer: &str| roles.opens(&caller, signer);
+        let gate = Gate { caller: &name, custodian, opens: &opens };
+        match self.access.progress_of(&mut self.signers, &mut KeystoreKeys, &handle, &gate) {
+            Ok(mut v) => {
+                v["ok"] = true.into();
+                v.to_string()
+            }
+            Err(ManagerError::Refused(_)) | Err(ManagerError::NotFound(_)) => not_authorized(),
+            Err(e) => err(e),
         }
-        let ok = self.access.reject(&handle).is_ok();
+    }
+
+    fn reject_access(&mut self, handle: String) -> bool {
+        let Some((name, custodian)) = self.access_caller() else {
+            return false;
+        };
+        let (roles, caller) = (self.roles.clone(), Self::caller());
+        let opens = |signer: &str| roles.opens(&caller, signer);
+        let gate = Gate { caller: &name, custodian, opens: &opens };
+        let ok = self.access.reject(&mut self.signers, &handle, &gate).is_ok();
         if ok {
             emit_access_settled(&handle, "rejected");
         }
@@ -930,10 +1044,16 @@ impl Core {
         self.refresh();
         let roster = self.signers.roster();
         let snapshots = self.origins.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let roles = &self.roles;
         let list: Vec<_> = roster
             .iter()
             .map(|(key, holders)| {
-                crate::roster::entry_json(key, holders, |f| crate::origins::of(&snapshots, &f.name, &f.account))
+                crate::roster::entry_json(
+                    key,
+                    holders,
+                    |f| crate::origins::of(&snapshots, &f.name, &f.account),
+                    |signer| roles.openers_of(signer),
+                )
             })
             .collect();
         json!({ "ok": true, "accounts": list }).to_string()
@@ -957,7 +1077,7 @@ impl Core {
         };
         // The whole configuration, so an approver can build a `configure` that keeps it: it is total.
         json!({ "ok": true, "kind": kind, "identity": name, "approvers": self.roles.approvers,
-                "custodians": self.roles.custodians, "signers": self.roles.signers })
+                "custodians": self.roles.custodians, "signers": self.roles.signers, "openers": self.roles.openers })
         .to_string()
     }
 }
@@ -1041,6 +1161,10 @@ impl SignerManagerModule for SignerManagerModuleImpl {
 
     fn approve_access(&self, params_json: String) -> String {
         self.core().approve_access(params_json)
+    }
+
+    fn access_progress(&self, handle: String) -> String {
+        self.core().access_progress(handle)
     }
 
     fn account_descriptors(&self, group: String) -> String {

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
-use logos_signer_interface::Family;
+use logos_signer_interface::{walletkey, Account, Family, JobState, Secret, WalletKey, WalletKeyRequest};
 
 use crate::btc::AccountPublic;
 use crate::error::{bad, ManagerError, Result};
@@ -181,7 +181,23 @@ enum Kind {
 enum State {
     Offered,
     Rendered,
+    /// Approved, and the chosen holder is working out the account's open key.
+    Opening,
     Settled(&'static str),
+}
+
+/// An open whose holder is working: a card waiting for its PIN session, a Shell for its button, a
+/// QR wallet for its answer.
+struct Opening {
+    found: Found,
+    group: String,
+    network: Option<String>,
+    job: String,
+    /// The job's last state, for the app to show: `working` or `confirm_on_device`.
+    step: &'static str,
+    /// The keystore's password, kept for the unlock asked with the open; wiped with the record.
+    password: Zeroizing<String>,
+    terms: Option<Terms>,
 }
 
 struct Record {
@@ -195,16 +211,31 @@ struct Record {
     offered_at: Instant,
     settled_at: Option<Instant>,
     result: Option<serde_json::Value>,
+    /// The app showing it: an open is one holder app's once it claims it.
+    opener: Option<String>,
+    opening: Option<Opening>,
+    /// Why the last approval didn't open it, as `(code, message)`, for the app to show.
+    last_error: Option<(Option<String>, String)>,
 }
 
-/// What the custodian decided: the wallet picked, its password, and the terms it granted.
+/// What the person decided: the wallet picked, the holder that opens it and its secret, and the
+/// terms granted.
 #[derive(Debug)]
 pub struct Decision {
     pub group: Option<String>,
     pub password: String,
     pub unlock: Option<Terms>,
-    /// A device wallet's first day of use, given at its first open.
+    /// A device wallet's first day of use, given at its first open (the old device vault's path).
     pub birthday: Option<String>,
+    /// The holder whose `wallet_key` opens it. None: the keystore's own path, as before.
+    pub signer: Option<String>,
+}
+
+/// Who may show and decide a request: the custodian, and the apps that open a holder's accounts.
+pub struct Gate<'a> {
+    pub caller: &'a str,
+    pub custodian: bool,
+    pub opens: &'a dyn Fn(&str) -> bool,
 }
 
 pub struct Shown {
@@ -213,9 +244,27 @@ pub struct Shown {
     pub kind: &'static str,
     pub bundle_id: String,
     pub lines: Vec<String>,
-    /// What was asked, for the keys app to offer: the wallet or the family and network to pick
-    /// from, and the terms an app wants. Never the reason, which is in `lines` as a claim.
+    /// What was asked, for the app to offer: the wallet or the family and network to pick from,
+    /// and the terms an app wants. Never the reason, which is in `lines` as a claim.
     pub asked: serde_json::Value,
+    /// The wallet's holders this app may open it with, ranked.
+    pub holders: Vec<serde_json::Value>,
+}
+
+/// What `approve` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Approved {
+    Settled,
+    /// The holder is working; `progress` settles it.
+    Opening,
+}
+
+/// What a holder's answer moved, for the glue to announce.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Move {
+    Settled(String, &'static str),
+    /// Back on screen, saying why.
+    Rendered(String),
 }
 
 pub struct Summary {
@@ -233,6 +282,7 @@ pub struct Access {
     grants: Vec<(String, String)>,
     scopes: Vec<Scope>,
     seq: u64,
+    moves: Vec<Move>,
 }
 
 fn sha256(b: &[u8]) -> [u8; 32] {
@@ -313,8 +363,24 @@ impl Access {
             offered_at: Instant::now(),
             settled_at: None,
             result: None,
+            opener: None,
+            opening: None,
+            last_error: None,
         });
         (handle, receipt)
+    }
+
+    /// May this caller show and decide the record? The custodian always; another app only for an
+    /// open naming a wallet one of whose holders it opens, and once it claims it, only that app.
+    fn may(&self, signers: &mut Registry, r: &Record, gate: &Gate) -> Result<bool> {
+        if r.opener.as_deref().is_some_and(|o| o != gate.caller) {
+            return Ok(false);
+        }
+        if gate.custodian {
+            return Ok(true);
+        }
+        let Kind::Open(OpenParams { group: Some(group), .. }) = &r.kind else { return Ok(false) };
+        Ok(signers.holders(group)?.iter().any(|f| (gate.opens)(&f.name)))
     }
 
     /// A module asks for a Bitcoin wallet: one it names, or any of a family and network the person
@@ -330,17 +396,17 @@ impl Access {
         match (&p.group, &p.family, &p.network) {
             (Some(g), None, n) => {
                 let found = signers.find(g)?;
-                let acct = AccountPublic::from_account(&found.account)?;
+                let (family, chain) = AccountPublic::kind_of(&found.account)?;
                 let name = found.account.label.clone().unwrap_or_else(|| found.account.id.clone());
                 let on = match n {
                     Some(n) => {
                         check_displayable(n, "network")?;
-                        acct.chain.network(n)?;
+                        chain.network(n)?;
                         format!(" on {n}")
                     }
                     None => String::new(),
                 };
-                lines.push(format!("Wallet: {name} ({}, {} chain){on}", acct.family.describe(), acct.chain.as_str()));
+                lines.push(format!("Wallet: {name} ({}, {} chain){on}", family.describe(), chain.as_str()));
             }
             (None, Some(f), Some(n)) if f.is_bitcoin() => {
                 let family = if *f == Family::Bitcoin { "native segwit" } else { "taproot" };
@@ -393,25 +459,46 @@ impl Access {
                     Kind::Open(_) => "open",
                     Kind::Unlock(_) => "unlock",
                 },
-                state: if r.state == State::Rendered { "rendered" } else { "offered" },
+                state: match r.state {
+                    State::Rendered => "rendered",
+                    State::Opening => "opening",
+                    _ => "offered",
+                },
                 age_ms: now.duration_since(r.offered_at).as_millis(),
             })
             .collect()
     }
 
-    pub fn acknowledge(&mut self, handle: &str) -> Result<Shown> {
+    pub fn acknowledge(&mut self, signers: &mut Registry, handle: &str, gate: &Gate) -> Result<Shown> {
         self.sweep();
+        let idx = self.records.iter().position(|r| r.handle == handle).ok_or_else(|| ManagerError::NotFound(handle.into()))?;
+        if !self.may(signers, &self.records[idx], gate)? {
+            return Err(ManagerError::Refused("not authorized".into()));
+        }
         for r in &mut self.records {
-            if r.state == State::Rendered && r.handle != handle {
+            if r.state == State::Rendered && r.handle != handle && r.opener.as_deref() == Some(gate.caller) {
                 r.state = State::Offered;
             }
         }
-        let r = self.records.iter_mut().find(|r| r.handle == handle).ok_or_else(|| ManagerError::NotFound(handle.into()))?;
-        if let State::Settled(o) = r.state {
-            return Err(bad(format!("already settled: {o}")));
+        let holders = match &self.records[idx].kind {
+            Kind::Open(OpenParams { group: Some(g), .. }) => signers
+                .holders(g)
+                .unwrap_or_default()
+                .iter()
+                .filter(|f| (gate.opens)(&f.name) || (gate.custodian && f.name == KEYSTORE))
+                .map(crate::roster::holder_json)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let r = &mut self.records[idx];
+        match r.state {
+            State::Settled(o) => return Err(bad(format!("already settled: {o}"))),
+            State::Opening => {}
+            _ => r.state = State::Rendered,
         }
-        r.state = State::Rendered;
+        r.opener = Some(gate.caller.to_string());
         Ok(Shown {
+            holders,
             handle: r.handle.clone(),
             requester: r.requester.clone(),
             kind: match r.kind {
@@ -428,7 +515,8 @@ impl Access {
         })
     }
 
-    /// The person decided in the keys app: the wallet, its password, and any unlock terms.
+    /// The person decided, in the keys app or a holder's app: the wallet, the holder that opens it
+    /// and its secret, and any unlock terms.
     pub fn approve(
         &mut self,
         signers: &mut Registry,
@@ -436,9 +524,13 @@ impl Access {
         handle: &str,
         bundle_id_echo: &str,
         decision: Decision,
-    ) -> Result<()> {
+        gate: &Gate,
+    ) -> Result<Approved> {
         self.sweep();
         let idx = self.records.iter().position(|r| r.handle == handle).ok_or_else(|| ManagerError::NotFound(handle.into()))?;
+        if !self.may(signers, &self.records[idx], gate)? {
+            return Err(ManagerError::Refused("not authorized".into()));
+        }
         let r = &self.records[idx];
         if r.state != State::Rendered {
             return Err(bad("approve_access: this handle was not the one being shown"));
@@ -448,6 +540,28 @@ impl Access {
         }
         let requester = r.requester.clone();
         let password = Zeroizing::new(decision.password);
+        if let (Kind::Open(p), Some(name)) = (&r.kind, decision.signer.as_deref()) {
+            let group = match (&p.group, &decision.group) {
+                (Some(asked), Some(picked)) if asked != picked => {
+                    return Err(bad("approve_access: this request names its wallet"));
+                }
+                (Some(g), _) | (None, Some(g)) => g.clone(),
+                (None, None) => return Err(bad("approve_access: pick the wallet to open")),
+            };
+            let start = StartOpen {
+                name: name.to_string(),
+                group,
+                family: p.family,
+                network: p.network.clone(),
+                terms: decision.unlock.or_else(|| p.unlock.clone()),
+                password,
+            };
+            return self.start_open(signers, keys, idx, gate, start);
+        }
+        // Naming no holder is the keys app's own path, as before.
+        if !gate.custodian {
+            return Err(ManagerError::Refused("not authorized".into()));
+        }
         let (result, scope) = match &r.kind {
             Kind::Open(p) => {
                 let group = match (&p.group, &decision.group) {
@@ -515,14 +629,165 @@ impl Access {
         let r = &mut self.records[idx];
         r.result = Some(result);
         r.state = State::Settled("approved");
-        Ok(())
+        Ok(Approved::Settled)
     }
 
-    pub fn reject(&mut self, handle: &str) -> Result<()> {
-        let r = self.records.iter_mut().find(|r| r.handle == handle).ok_or_else(|| ManagerError::NotFound(handle.into()))?;
+    /// Hand the open to the chosen holder: it works out the account's open key in its own time.
+    fn start_open(
+        &mut self,
+        signers: &mut Registry,
+        keys: &mut dyn KeyHolder,
+        idx: usize,
+        gate: &Gate,
+        start: StartOpen,
+    ) -> Result<Approved> {
+        if !(gate.opens)(&start.name) && !(gate.custodian && start.name == KEYSTORE) {
+            return Err(ManagerError::Refused("not authorized".into()));
+        }
+        let found = signers.holder(&start.group, &start.name)?;
+        if !found.info.wallet_key || !found.account.family.is_bitcoin() {
+            return Err(bad(format!("approve_access: {} doesn't open Bitcoin wallets itself", start.name)));
+        }
+        if start.family.is_some_and(|f| f != found.account.family) {
+            return Err(bad("approve_access: the wallet picked is not the family asked for"));
+        }
+        if start.terms.is_some() && start.name != KEYSTORE {
+            return Err(bad("approve_access: a device account signs on its device; there is nothing to unlock"));
+        }
+        if let Some(t) = &start.terms {
+            t.check()?;
+        }
+        let secret = (!start.password.is_empty()).then(|| Secret::new(start.password.as_str()));
+        let request = WalletKeyRequest { account: found.account.id.clone(), secret };
+        let job = signers.signer(found.signer).wallet_key(request)?;
+        let r = &mut self.records[idx];
+        r.state = State::Opening;
+        r.last_error = None;
+        r.opening = Some(Opening {
+            found,
+            group: start.group,
+            network: start.network,
+            job,
+            step: "working",
+            password: start.password,
+            terms: start.terms,
+        });
+        let handle = r.handle.clone();
+        // A wrong PIN, or a holder that answers at once, comes back here and not as an event.
+        let failed = self.advance(signers, keys, &handle);
+        self.moves.retain(|m| !matches!(m, Move::Settled(h, "approved") | Move::Rendered(h) if *h == handle));
+        let r = self.records.iter().find(|r| r.handle == handle).expect("advanced, not removed");
+        match (r.state, failed) {
+            (State::Opening, _) => Ok(Approved::Opening),
+            (State::Settled("approved"), _) => Ok(Approved::Settled),
+            (_, Some(e)) => Err(e),
+            (State::Settled(o), None) => Err(bad(format!("the holder settled this as {o}"))),
+            _ => Err(bad("the holder did not open the wallet")),
+        }
+    }
+
+    /// Move every open whose holder is working, once.
+    pub fn progress(&mut self, signers: &mut Registry, keys: &mut dyn KeyHolder) {
+        self.sweep();
+        let working: Vec<String> =
+            self.records.iter().filter(|r| r.state == State::Opening).map(|r| r.handle.clone()).collect();
+        for h in working {
+            self.advance(signers, keys, &h);
+        }
+    }
+
+    /// Ask the holder how its open key stands, and settle the open when it has it. The error, when
+    /// it went back on screen or was declined.
+    fn advance(&mut self, signers: &mut Registry, keys: &mut dyn KeyHolder, handle: &str) -> Option<ManagerError> {
+        let idx = self.records.iter().position(|r| r.handle == handle)?;
+        let requester = self.records[idx].requester.clone();
+        let o = self.records[idx].opening.as_mut()?;
+        let signer = signers.signer(o.found.signer);
+        let outcome = (|| -> Result<Option<(serde_json::Value, Option<Scope>)>> {
+            let st = signer.wallet_key_status(&o.job)?;
+            match st.state {
+                JobState::Working | JobState::ConfirmOnDevice => {
+                    o.step = st.state.as_str();
+                    Ok(None)
+                }
+                JobState::Done => {
+                    let key = signer.wallet_key_result(&o.job)?;
+                    Ok(Some(opened(o, key, keys, &requester)?))
+                }
+                JobState::Refused => Err(ManagerError::Refused("declined on the device".into())),
+                JobState::Failed | JobState::Cancelled => Err(st.error.map(ManagerError::from).unwrap_or_else(|| {
+                    ManagerError::Signing(format!("the holder's job ended {}", st.state.as_str()))
+                })),
+            }
+        })();
+        let r = &mut self.records[idx];
+        let mut failed = None;
+        let moved = match outcome {
+            Ok(None) => return None,
+            Ok(Some((result, scope))) => {
+                let group = r.opening.as_ref().map(|o| o.group.clone()).unwrap_or_default();
+                r.result = Some(result);
+                r.state = State::Settled("approved");
+                r.opening = None;
+                self.grants.retain(|(m, g)| !(m == &requester && g == &group));
+                self.grants.push((requester, group));
+                if let Some(s) = scope {
+                    self.scopes.retain(|x| x.account != s.account);
+                    self.scopes.push(s);
+                }
+                Move::Settled(handle.to_string(), "approved")
+            }
+            Err(e @ ManagerError::Refused(_)) => {
+                r.state = State::Settled("rejected");
+                r.opening = None;
+                failed = Some(e);
+                Move::Settled(handle.to_string(), "rejected")
+            }
+            Err(e) => {
+                // Back on screen, saying why, so the person can try again or pick another holder.
+                r.last_error = Some((e.wire_code(), e.to_string()));
+                r.state = State::Rendered;
+                r.opening = None;
+                failed = Some(e);
+                Move::Rendered(handle.to_string())
+            }
+        };
+        self.moves.push(moved);
+        failed
+    }
+
+    /// What moved since the last call, for the glue to announce.
+    pub fn drain_moves(&mut self) -> Vec<Move> {
+        std::mem::take(&mut self.moves)
+    }
+
+    /// How an open stands, for the app showing it: `{ state, step?, outcome?, code?, error? }`.
+    pub fn progress_of(&mut self, signers: &mut Registry, keys: &mut dyn KeyHolder, handle: &str, gate: &Gate) -> Result<serde_json::Value> {
+        self.progress(signers, keys);
+        let idx = self.records.iter().position(|r| r.handle == handle).ok_or_else(|| ManagerError::NotFound(handle.into()))?;
+        if !self.may(signers, &self.records[idx], gate)? {
+            return Err(ManagerError::Refused("not authorized".into()));
+        }
+        let r = &self.records[idx];
+        let (code, error) = r.last_error.clone().map_or((None, None), |(c, e)| (c, Some(e)));
+        Ok(match r.state {
+            State::Offered => serde_json::json!({ "state": "offered" }),
+            State::Rendered => serde_json::json!({ "state": "rendered", "code": code, "error": error }),
+            State::Opening => serde_json::json!({ "state": "opening", "step": r.opening.as_ref().map(|o| o.step) }),
+            State::Settled(o) => serde_json::json!({ "state": "settled", "outcome": o }),
+        })
+    }
+
+    pub fn reject(&mut self, signers: &mut Registry, handle: &str, gate: &Gate) -> Result<()> {
+        let idx = self.records.iter().position(|r| r.handle == handle).ok_or_else(|| ManagerError::NotFound(handle.into()))?;
+        if !self.may(signers, &self.records[idx], gate)? {
+            return Err(ManagerError::Refused("not authorized".into()));
+        }
+        let r = &mut self.records[idx];
         if let State::Settled(o) = r.state {
             return Err(bad(format!("already settled: {o}")));
         }
+        cancel_opening(signers, r);
         r.state = State::Settled("rejected");
         Ok(())
     }
@@ -532,6 +797,7 @@ impl Access {
         Ok(match self.by_receipt(handle, receipt)?.state {
             State::Offered => ("offered", None),
             State::Rendered => ("rendered", None),
+            State::Opening => ("opening", None),
             State::Settled(o) => ("settled", Some(o)),
         })
     }
@@ -548,9 +814,10 @@ impl Access {
         Ok(())
     }
 
-    pub fn cancel(&mut self, handle: &str, receipt: &str) -> Result<()> {
+    pub fn cancel(&mut self, signers: &mut Registry, handle: &str, receipt: &str) -> Result<()> {
         let r = self.by_receipt(handle, receipt)?;
         if !matches!(r.state, State::Settled(_)) {
+            cancel_opening(signers, r);
             r.state = State::Settled("cancelled");
         }
         r.result = None;
@@ -638,6 +905,62 @@ impl Access {
     }
 }
 
+/// An open, as the person decided it, for the holder to start.
+struct StartOpen {
+    name: String,
+    group: String,
+    family: Option<Family>,
+    network: Option<String>,
+    terms: Option<Terms>,
+    password: Zeroizing<String>,
+}
+
+fn cancel_opening(signers: &mut Registry, r: &mut Record) {
+    if let Some(o) = r.opening.take() {
+        let _ = signers.signer(o.found.signer).cancel_wallet_key(&o.job);
+    }
+}
+
+/// The open's result from the holder's answer: its xpub proven to be the account's, the
+/// descriptors, and the database key its seed gives. The manager keeps neither once collected.
+fn opened(o: &Opening, key: WalletKey, keys: &mut dyn KeyHolder, requester: &str) -> Result<(serde_json::Value, Option<Scope>)> {
+    let account = &o.found.account;
+    let roster_key = crate::roster::key_of(account).ok_or_else(|| bad("this wallet has no roster key"))?;
+    walletkey::check_xpub(&roster_key, account.family, account.chain, &key.xpub)
+        .map_err(|_| bad("the holder answered with another wallet's xpub"))?;
+    let acct = AccountPublic::from_account(&Account { xpub: Some(key.xpub.clone()), ..account.clone() })?;
+    if let Some(n) = &o.network {
+        acct.chain.network(n)?;
+    }
+    let database_key = match (&key.database_key, account.opens_by_password) {
+        (Some(k), _) if k.expose().len() == 64 && k.expose().bytes().all(|b| b.is_ascii_hexdigit()) => Some(k.expose()),
+        (None, true) => None,
+        _ => return Err(bad("the holder answered without a database key")),
+    };
+    let origin = key.origin.as_deref().filter(|o| *o == "created").unwrap_or("restored");
+    let birthday = key.birthday.as_deref().filter(|b| is_day(b));
+    let scope = match &o.terms {
+        Some(t) => {
+            keys.unlock(&o.group, &o.password, t.ttl_ms, t.count)?;
+            Some(scope_for(&o.group, t, requester))
+        }
+        None => None,
+    };
+    let result = serde_json::json!({
+        "group": o.group, "family": account.family, "chain": acct.chain.as_str(), "network": o.network,
+        "external": acct.descriptor(0), "internal": acct.descriptor(1),
+        "fingerprint": acct.fingerprint.to_string(), "databaseKey": database_key,
+        "opensByPassword": account.opens_by_password, "origin": origin, "birthday": birthday,
+        "unlocked": o.terms, "signer": o.found.name,
+    });
+    Ok((result, scope))
+}
+
+/// `YYYY-MM-DD`; anything else is dropped, not passed on.
+fn is_day(s: &str) -> bool {
+    s.len() == 10 && s.bytes().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() })
+}
+
 /// Whose name a device wallet's database key is kept under: the holder that already has one,
 /// else the first in configured order. So reopening it through the Shell instead of the reader
 /// finds the same key, and the wallet's database with it.
@@ -663,6 +986,7 @@ fn scope_for(account: &str, terms: &Terms, requester: &str) -> Scope {
 pub(crate) mod tests {
     use super::*;
     use logos_signer_interface::mock::{MockOptions, MockSigner};
+    use logos_signer_interface::{Collects, JobStatus, SignRequest, Signature, Signer, SignerInfo};
 
     /// The keystore's extras, in memory: password "pw", a fixed database key, unlocks by account.
     #[derive(Default)]
@@ -723,6 +1047,20 @@ pub(crate) mod tests {
         }
     }
 
+    fn no_holder(_: &str) -> bool {
+        false
+    }
+
+    /// The keys app: the custodian, opening nobody's accounts but the keystore's.
+    pub(crate) fn keys_app() -> Gate<'static> {
+        Gate { caller: "evm_keystore_ui", custodian: true, opens: &no_holder }
+    }
+
+    /// A holder's app, opening the accounts of the signers it serves.
+    fn app(caller: &'static str, serves: &'static [&'static str]) -> Gate<'static> {
+        Gate { caller, custodian: false, opens: Box::leak(Box::new(move |s: &str| serves.contains(&s))) }
+    }
+
     fn fixture() -> (Registry, FakeKeys, Access) {
         let mut r = Registry::new();
         r.add("keystore_module", Box::new(MockSigner::new(MockOptions::default())));
@@ -735,18 +1073,18 @@ pub(crate) mod tests {
         let req = |n: &str| format!(r#"{{"group":"mock-segwit","network":"{n}"}}"#);
         assert!(a.request_open(&mut s, "bitcoin_wallet_core_module", &req("bitcoin")).is_err(), "a test wallet on mainnet");
         let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", &req("regtest")).unwrap();
-        let shown = a.acknowledge(&h).unwrap();
+        let shown = a.acknowledge(&mut s, &h, &keys_app()).unwrap();
         assert!(shown.lines.iter().any(|l| l.ends_with("test chain) on regtest")), "{:?}", shown.lines);
-        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).unwrap();
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None), &keys_app()).unwrap();
         assert_eq!(a.fetch(&h, &r).unwrap()["network"], "regtest");
         let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"group":"mock-segwit"}"#).unwrap();
-        let shown = a.acknowledge(&h).unwrap();
-        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).unwrap();
+        let shown = a.acknowledge(&mut s, &h, &keys_app()).unwrap();
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None), &keys_app()).unwrap();
         assert!(a.fetch(&h, &r).unwrap()["network"].is_null(), "named nothing, echoes nothing");
     }
 
     fn decide(group: Option<&str>, password: &str, unlock: Option<Terms>) -> Decision {
-        Decision { group: group.map(str::to_string), password: password.into(), unlock, birthday: None }
+        Decision { group: group.map(str::to_string), password: password.into(), unlock, birthday: None, signer: None }
     }
 
     /// A device's module offering the mock's accounts, and no keystore.
@@ -762,7 +1100,7 @@ pub(crate) mod tests {
         let ask = r#"{"group":"mock-segwit","network":"regtest","unlock":{"ttlMs":60000}}"#;
         let open = |a: &mut Access, s: &mut Registry| {
             let (h, r) = a.request_open(s, "bitcoin_wallet_core_module", ask).unwrap();
-            let bundle = a.acknowledge(&h).unwrap().bundle_id;
+            let bundle = a.acknowledge(s, &h, &keys_app()).unwrap().bundle_id;
             (h, r, bundle)
         };
         let decision = |pw: &str, unlock: Option<Terms>, birthday: Option<&str>| Decision {
@@ -770,11 +1108,12 @@ pub(crate) mod tests {
             password: pw.into(),
             unlock,
             birthday: birthday.map(str::to_string),
+            signer: None,
         };
         let (h, r, b) = open(&mut a, &mut s);
         let terms = Terms { ttl_ms: Some(1000), confirm: true, ..Default::default() };
-        assert!(a.approve(&mut s, &mut k, &h, &b, decision("data-pw", Some(terms), None)).is_err(), "nothing to unlock");
-        a.approve(&mut s, &mut k, &h, &b, decision("data-pw", None, Some("2021-11-14"))).unwrap();
+        assert!(a.approve(&mut s, &mut k, &h, &b, decision("data-pw", Some(terms), None), &keys_app()).is_err(), "nothing to unlock");
+        a.approve(&mut s, &mut k, &h, &b, decision("data-pw", None, Some("2021-11-14")), &keys_app()).unwrap();
         let got = a.fetch(&h, &r).unwrap();
         assert_eq!((got["origin"].as_str(), got["birthday"].as_str()), (Some("restored"), Some("2021-11-14")));
         assert_eq!(got["unlocked"], serde_json::Value::Null, "the app asked for terms; a device grants none");
@@ -783,9 +1122,9 @@ pub(crate) mod tests {
 
         // Opened again: the same key, behind the password set the first time.
         let (h, r, b) = open(&mut a, &mut s);
-        assert!(a.approve(&mut s, &mut k, &h, &b, decision("nope", None, None)).is_err());
+        assert!(a.approve(&mut s, &mut k, &h, &b, decision("nope", None, None), &keys_app()).is_err());
         assert_eq!(a.status(&h, &r).unwrap().0, "rendered", "a wrong password leaves it on screen");
-        a.approve(&mut s, &mut k, &h, &b, decision("data-pw", None, None)).unwrap();
+        a.approve(&mut s, &mut k, &h, &b, decision("data-pw", None, None), &keys_app()).unwrap();
         assert_eq!(a.fetch(&h, &r).unwrap()["databaseKey"].as_str(), Some(first.as_str()));
 
         // And an unlock is refused before anything is shown.
@@ -804,8 +1143,8 @@ pub(crate) mod tests {
         k.devices.insert(shell.clone(), ("data-pw".into(), "cd".repeat(32), None));
         assert_eq!(s.find("mock-segwit").unwrap().name, "keycard_module");
         let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"group":"mock-segwit"}"#).unwrap();
-        let bundle = a.acknowledge(&h).unwrap().bundle_id;
-        a.approve(&mut s, &mut k, &h, &bundle, decide(None, "data-pw", None)).unwrap();
+        let bundle = a.acknowledge(&mut s, &h, &keys_app()).unwrap().bundle_id;
+        a.approve(&mut s, &mut k, &h, &bundle, decide(None, "data-pw", None), &keys_app()).unwrap();
         assert_eq!(a.fetch(&h, &r).unwrap()["databaseKey"].as_str(), Some("cd".repeat(32).as_str()));
         assert_eq!(k.devices.keys().collect::<Vec<_>>(), vec![&shell], "no second key, no second database");
     }
@@ -814,23 +1153,23 @@ pub(crate) mod tests {
     fn a_keystore_wallet_takes_no_birthday_at_open() {
         let (mut s, mut k, mut a) = fixture();
         let (h, _) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"group":"mock-segwit","network":"regtest"}"#).unwrap();
-        let bundle = a.acknowledge(&h).unwrap().bundle_id;
-        let d = Decision { group: None, password: "pw".into(), unlock: None, birthday: Some("2021-11-14".into()) };
-        assert!(a.approve(&mut s, &mut k, &h, &bundle, d).is_err(), "it was set when the wallet was made");
+        let bundle = a.acknowledge(&mut s, &h, &keys_app()).unwrap().bundle_id;
+        let d = Decision { group: None, password: "pw".into(), unlock: None, birthday: Some("2021-11-14".into()), signer: None };
+        assert!(a.approve(&mut s, &mut k, &h, &bundle, d, &keys_app()).is_err(), "it was set when the wallet was made");
     }
 
     #[test]
     fn an_open_request_gives_the_requester_its_wallet_and_nobody_else_its_descriptors() {
         let (mut s, mut k, mut a) = fixture();
         let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"family":"bitcoin","network":"signet"}"#).unwrap();
-        let shown = a.acknowledge(&h).unwrap();
+        let shown = a.acknowledge(&mut s, &h, &keys_app()).unwrap();
         assert!(shown.lines.join("\n").contains("Any native segwit wallet on signet"), "{:?}", shown.lines);
         assert_eq!(shown.asked, serde_json::json!({ "group": null, "family": "bitcoin", "network": "signet", "unlock": null }));
-        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).is_err(), "no wallet picked");
-        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-taproot"), "pw", None)).is_err(), "wrong family");
-        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "nope", None)).is_err());
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None), &keys_app()).is_err(), "no wallet picked");
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-taproot"), "pw", None), &keys_app()).is_err(), "wrong family");
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "nope", None), &keys_app()).is_err());
         assert_eq!(a.status(&h, &r).unwrap().0, "rendered", "a wrong password leaves it on screen");
-        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "pw", None)).unwrap();
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(Some("mock-segwit"), "pw", None), &keys_app()).unwrap();
         let got = a.fetch(&h, &r).unwrap();
         assert_eq!(got["group"], "mock-segwit");
         assert_eq!((got["chain"].as_str(), got["network"].as_str()), (Some("test"), Some("signet")));
@@ -852,9 +1191,9 @@ pub(crate) mod tests {
         let (h, _) = a
             .request_open(&mut s, "wallet_core", r#"{"group":"mock-taproot","unlock":{"ttlMs":3600000}}"#)
             .unwrap();
-        let shown = a.acknowledge(&h).unwrap();
+        let shown = a.acknowledge(&mut s, &h, &keys_app()).unwrap();
         assert!(shown.lines.join("\n").contains("for 60 minutes, for wallet_core, each one confirmed"), "{:?}", shown.lines);
-        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).unwrap();
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None), &keys_app()).unwrap();
         assert_eq!(a.covers("mock-taproot", "wallet_core"), Cover::Confirmed);
         assert_eq!(a.covers("mock-taproot", "another_app"), Cover::No);
         assert_eq!(k.unlocks.len(), 1);
@@ -869,11 +1208,11 @@ pub(crate) mod tests {
         let (h, r) = a
             .request_unlock(&mut s, "game", r#"{"account":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","count":50,"ttlMs":1800000,"confirm":false,"apps":["game"]}"#)
             .unwrap();
-        let shown = a.acknowledge(&h).unwrap();
+        let shown = a.acknowledge(&mut s, &h, &keys_app()).unwrap();
         assert!(shown.lines.join("\n").contains("WITHOUT showing them to you"), "{:?}", shown.lines);
         // The person keeps confirmation on and allows ten.
         let granted = Terms { ttl_ms: Some(600_000), count: Some(10), apps: vec!["game".into()], confirm: true };
-        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", Some(granted))).unwrap();
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", Some(granted)), &keys_app()).unwrap();
         let got = a.fetch(&h, &r).unwrap();
         assert_eq!(got["terms"]["count"], 10);
         assert_eq!(got["terms"]["confirm"], true);
@@ -927,5 +1266,188 @@ pub(crate) mod tests {
         assert!(a.request_open(&mut s, "noisy", r#"{"group":"mock-segwit"}"#).is_err());
         assert!(a.request_open(&mut s, "quiet", r#"{"group":"mock-segwit"}"#).is_ok());
         assert!(a.request_open(&mut s, "x", r#"{"group":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"}"#).is_err(), "an EVM account is no wallet");
+    }
+
+    /// A device the test presses, shared with the registry; it may answer with another wallet's xpub.
+    #[derive(Clone)]
+    struct Pressable {
+        device: std::sync::Arc<std::sync::Mutex<MockSigner>>,
+        lie: Option<String>,
+    }
+
+    impl Pressable {
+        fn new(opts: MockOptions) -> Self {
+            Pressable { device: std::sync::Arc::new(std::sync::Mutex::new(MockSigner::new(opts))), lie: None }
+        }
+        fn press(&self, yes: bool) {
+            let mut d = self.device.lock().unwrap();
+            let jobs = d.waiting_keys();
+            assert_eq!(jobs.len(), 1, "one open waiting on the device");
+            if yes { d.confirm(&jobs[0]).unwrap() } else { d.refuse(&jobs[0]).unwrap() }
+        }
+        fn waiting(&self) -> usize {
+            self.device.lock().unwrap().waiting_keys().len()
+        }
+    }
+
+    impl Signer for Pressable {
+        fn info(&self) -> SignerInfo {
+            self.device.lock().unwrap().info()
+        }
+        fn accounts(&mut self) -> logos_signer_interface::Result<Vec<Account>> {
+            self.device.lock().unwrap().accounts()
+        }
+        fn sign(&mut self, request: SignRequest) -> logos_signer_interface::Result<String> {
+            self.device.lock().unwrap().sign(request)
+        }
+        fn status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+            self.device.lock().unwrap().status(job)
+        }
+        fn result(&mut self, job: &str) -> logos_signer_interface::Result<Vec<Signature>> {
+            self.device.lock().unwrap().result(job)
+        }
+        fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+            self.device.lock().unwrap().cancel(job)
+        }
+        fn wallet_key(&mut self, request: WalletKeyRequest) -> logos_signer_interface::Result<String> {
+            self.device.lock().unwrap().wallet_key(request)
+        }
+        fn wallet_key_status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+            self.device.lock().unwrap().wallet_key_status(job)
+        }
+        fn wallet_key_result(&mut self, job: &str) -> logos_signer_interface::Result<WalletKey> {
+            let key = self.device.lock().unwrap().wallet_key_result(job)?;
+            Ok(WalletKey { xpub: self.lie.clone().unwrap_or(key.xpub), ..key })
+        }
+        fn cancel_wallet_key(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+            self.device.lock().unwrap().cancel_wallet_key(job)
+        }
+    }
+
+    fn by(signer: &str, secret: &str) -> Decision {
+        Decision { group: None, password: secret.into(), unlock: None, birthday: None, signer: Some(signer.into()) }
+    }
+
+    /// One seed in a reader (a PIN) and in the Shell (a press), neither listing its xpub.
+    fn two_holders() -> (Registry, Pressable) {
+        let pin = MockOptions { collects: Collects::Pin, secret: "123456".into(), list_xpub: false, ..Default::default() };
+        let press = MockOptions { needs_confirmation: true, list_xpub: false, ..Default::default() };
+        let shell = Pressable::new(press);
+        let mut s = Registry::new();
+        s.add("keycard_module", Box::new(Pressable::new(pin)));
+        s.add("keycard_shell_module", Box::new(shell.clone()));
+        (s, shell)
+    }
+
+    const OPEN: &str = r#"{"group":"mock-segwit","network":"regtest"}"#;
+
+    fn refused<T>(r: Result<T>) -> bool {
+        matches!(r, Err(ManagerError::Refused(_)))
+    }
+
+    #[test]
+    fn a_device_wallet_opens_through_its_holders_app_and_each_holder_gives_the_same_key() {
+        let (mut s, shell) = two_holders();
+        let (mut k, mut a) = (FakeKeys::default(), Access::new());
+        let keycard_ui = app("keycard_ui", &["keycard_module", "keycard_shell_module"]);
+
+        let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", OPEN).unwrap();
+        let shown = a.acknowledge(&mut s, &h, &keycard_ui).unwrap();
+        let mut holders: Vec<_> = shown.holders.iter().map(|x| (x["signer"].as_str().unwrap(), x["opens"] == true)).collect();
+        holders.sort();
+        assert_eq!(holders, [("keycard_module", true), ("keycard_shell_module", true)]);
+        let wrong = a.approve(&mut s, &mut k, &h, &shown.bundle_id, by("keycard_module", "000000"), &keycard_ui).unwrap_err();
+        assert_eq!(wrong.wire_code().as_deref(), Some("wrong_secret"));
+        assert_eq!(a.status(&h, &r).unwrap().0, "rendered", "a wrong PIN leaves it on screen");
+        let opened = a.approve(&mut s, &mut k, &h, &shown.bundle_id, by("keycard_module", "123456"), &keycard_ui);
+        assert_eq!(opened.unwrap(), Approved::Settled);
+        assert!(a.drain_moves().is_empty(), "settled at once: the reply says so, no second event");
+        let got = a.fetch(&h, &r).unwrap();
+        let first = got["databaseKey"].as_str().unwrap().to_string();
+        assert!(first.len() == 64 && got["external"].as_str().unwrap().starts_with("wpkh(["), "{got}");
+        assert_eq!((got["signer"].as_str(), got["network"].as_str()), (Some("keycard_module"), Some("regtest")));
+        assert_eq!((got["opensByPassword"] == false, got["origin"].as_str()), (true, Some("restored")));
+        assert!(k.devices.is_empty(), "no data password, nothing kept in the keystore");
+
+        // Again through the Shell: it waits for the press, and its seed gives the same key.
+        let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", OPEN).unwrap();
+        let bundle = a.acknowledge(&mut s, &h, &keycard_ui).unwrap().bundle_id;
+        let opening = a.approve(&mut s, &mut k, &h, &bundle, by("keycard_shell_module", ""), &keycard_ui);
+        assert_eq!(opening.unwrap(), Approved::Opening);
+        assert_eq!(a.status(&h, &r).unwrap().0, "opening");
+        let p = a.progress_of(&mut s, &mut k, &h, &keycard_ui).unwrap();
+        assert_eq!((p["state"].as_str(), p["step"].as_str()), (Some("opening"), Some("confirm_on_device")));
+        assert!(a.queue().iter().any(|q| q.handle == h && q.state == "opening"));
+        shell.press(true);
+        a.progress(&mut s, &mut k);
+        assert_eq!(a.drain_moves(), vec![Move::Settled(h.clone(), "approved")]);
+        assert_eq!(a.fetch(&h, &r).unwrap()["databaseKey"].as_str(), Some(first.as_str()));
+        assert!(a.open_accounts().contains(&("bitcoin_wallet_core_module".into(), "mock-segwit".into())));
+    }
+
+    #[test]
+    fn only_a_holders_app_opens_it_and_the_first_to_show_it_keeps_it() {
+        let (mut s, _) = two_holders();
+        let (mut k, mut a) = (FakeKeys::default(), Access::new());
+        let keycard_ui = app("keycard_ui", &["keycard_module", "keycard_shell_module"]);
+        let qr_ui = app("qr_signer_ui", &["qr_signer_module"]);
+
+        let (h, r) = a.request_open(&mut s, "bitcoin_wallet_core_module", OPEN).unwrap();
+        assert!(refused(a.acknowledge(&mut s, &h, &qr_ui)), "QR Wallets holds no seed of this wallet");
+        // The keys app may show it, and opens only with the keystore.
+        let bundle = a.acknowledge(&mut s, &h, &keys_app()).unwrap().bundle_id;
+        assert!(refused(a.approve(&mut s, &mut k, &h, &bundle, by("keycard_module", "123456"), &keys_app())));
+        assert!(refused(a.acknowledge(&mut s, &h, &keycard_ui)), "shown in the keys app, it is the keys app's");
+        a.cancel(&mut s, &h, &r).unwrap();
+
+        let (h, _) = a.request_open(&mut s, "bitcoin_wallet_core_module", OPEN).unwrap();
+        let bundle = a.acknowledge(&mut s, &h, &keycard_ui).unwrap().bundle_id;
+        assert!(refused(a.acknowledge(&mut s, &h, &keys_app())), "shown in the Keycard app, it is the Keycard app's");
+        assert!(refused(a.reject(&mut s, &h, &keys_app())));
+        let legacy = a.approve(&mut s, &mut k, &h, &bundle, decide(None, "pw", None), &keycard_ui);
+        assert!(refused(legacy), "naming no holder is the keys app's own path");
+        assert!(refused(a.approve(&mut s, &mut k, &h, &bundle, by("qr_signer_module", ""), &keycard_ui)));
+
+        // An open that names no wallet, and an unlock, stay with the keys app.
+        let (h, _) = a.request_open(&mut s, "other_app", r#"{"family":"bitcoin","network":"regtest"}"#).unwrap();
+        assert!(refused(a.acknowledge(&mut s, &h, &keycard_ui)));
+    }
+
+    #[test]
+    fn a_declined_or_cancelled_open_ends_the_devices_job_and_a_foreign_xpub_opens_nothing() {
+        let (mut s, shell) = two_holders();
+        let (mut k, mut a) = (FakeKeys::default(), Access::new());
+        let keycard_ui = app("keycard_ui", &["keycard_module", "keycard_shell_module"]);
+        let start = |a: &mut Access, s: &mut Registry, k: &mut FakeKeys| {
+            let (h, r) = a.request_open(s, "bitcoin_wallet_core_module", OPEN).unwrap();
+            let bundle = a.acknowledge(s, &h, &keycard_ui).unwrap().bundle_id;
+            assert_eq!(a.approve(s, k, &h, &bundle, by("keycard_shell_module", ""), &keycard_ui).unwrap(), Approved::Opening);
+            (h, r)
+        };
+        let (h, r) = start(&mut a, &mut s, &mut k);
+        shell.press(false);
+        a.progress(&mut s, &mut k);
+        assert_eq!(a.drain_moves(), vec![Move::Settled(h.clone(), "rejected")]);
+        assert_eq!(a.status(&h, &r).unwrap(), ("settled", Some("rejected")));
+
+        let (h, r) = start(&mut a, &mut s, &mut k);
+        assert_eq!(shell.waiting(), 1);
+        a.cancel(&mut s, &h, &r).unwrap();
+        assert_eq!(shell.waiting(), 0, "the device stops asking");
+
+        // A holder answering with another wallet's xpub: back on screen, nothing handed over.
+        let mut s = Registry::new();
+        let mut liar = Pressable::new(MockOptions { list_xpub: false, ..Default::default() });
+        let (_, _, theirs) = crate::psbt::tests::ours(crate::btc::Family::Taproot);
+        liar.lie = Some(theirs.xpub.to_string());
+        s.add("keycard_module", Box::new(liar));
+        let (h, r) = a.request_open(&mut s, "other_app", OPEN).unwrap();
+        let bundle = a.acknowledge(&mut s, &h, &keycard_ui).unwrap().bundle_id;
+        let e = a.approve(&mut s, &mut k, &h, &bundle, by("keycard_module", ""), &keycard_ui).unwrap_err();
+        assert!(e.to_string().contains("another wallet's xpub"), "{e}");
+        assert_eq!(a.status(&h, &r).unwrap().0, "rendered");
+        assert!(a.fetch(&h, &r).is_err());
+        let p = a.progress_of(&mut s, &mut k, &h, &keycard_ui).unwrap();
+        assert!(p["error"].as_str().unwrap().contains("another wallet's xpub"), "{p}");
     }
 }

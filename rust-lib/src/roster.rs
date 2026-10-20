@@ -2,32 +2,30 @@
 //! Bitcoin wallet is `g_…` in the keystore, `keycard-…` on a card), so holders are grouped by what
 //! the account is: its address, or a Bitcoin account's key.
 
-use std::str::FromStr;
-
-use bitcoin::bip32::Xpub;
+use logos_signer_interface::walletkey::roster_key;
 use logos_signer_interface::{Account, Family};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::registry::Found;
 
 /// The keystore's module: the only signer that signs inside an unlock.
 pub const KEYSTORE: &str = "keystore_module";
 
-/// What makes two signers' accounts one: an EVM address without case, or `btc_` and 32 hex of a
-/// hash over a Bitcoin account's family, chain, chain code and key, whatever its xpub's metadata.
+/// What makes two signers' accounts one: an EVM address without case, or a Bitcoin account's roster
+/// key (`btc_` and 32 hex of a hash over its family, chain, chain code and key), as its signer lists
+/// it or, from a signer that still lists xpubs, worked out from the xpub.
 pub fn key_of(a: &Account) -> Option<String> {
     if a.family == Family::Evm {
         let address = a.address.as_deref().unwrap_or(&a.id).trim();
         return (!address.is_empty()).then(|| address.to_ascii_lowercase());
     }
-    let xpub = Xpub::from_str(a.xpub.as_deref()?).ok()?;
-    let mut h = Sha256::new();
-    h.update(serde_json::to_string(&a.family).ok()?.as_bytes());
-    h.update(serde_json::to_string(&a.chain).ok()?.as_bytes());
-    h.update(xpub.chain_code.as_bytes());
-    h.update(xpub.public_key.serialize());
-    Some(format!("btc_{}", hex::encode(&h.finalize()[..16])))
+    let listed = a.key.as_deref().map(str::trim).filter(|k| {
+        k.len() == 36 && k.starts_with("btc_") && k[4..].bytes().all(|b| b.is_ascii_hexdigit())
+    });
+    match listed {
+        Some(k) => Some(k.to_ascii_lowercase()),
+        None => roster_key(a.family, a.chain, a.xpub.as_deref()?).ok(),
+    }
 }
 
 /// How a signer reaches its keys.
@@ -132,9 +130,14 @@ pub fn wallet(holders: &[Found], origin_of: impl Fn(&Found) -> Option<serde_json
     serde_json::json!({ "fingerprint": fingerprint, "name": name })
 }
 
-/// One account of `roster()`: what it is, its names, its wallet and every holder, ranked. Public,
-/// and no xpub: it would show a Bitcoin wallet's whole history.
-pub fn entry_json(key: &str, holders: &[Found], origin_of: impl Fn(&Found) -> Option<serde_json::Value>) -> serde_json::Value {
+/// One account of `roster()`: what it is, its names, its wallet and every holder, ranked, with the
+/// apps that open it through each. Public, and no xpub: it would show a Bitcoin wallet's whole history.
+pub fn entry_json(
+    key: &str,
+    holders: &[Found],
+    origin_of: impl Fn(&Found) -> Option<serde_json::Value>,
+    openers_of: impl Fn(&str) -> Vec<String>,
+) -> serde_json::Value {
     let Some(first) = holders.first() else { return serde_json::Value::Null };
     let (label, labels) = names(holders);
     serde_json::json!({
@@ -142,23 +145,31 @@ pub fn entry_json(key: &str, holders: &[Found], origin_of: impl Fn(&Found) -> Op
         "address": first.account.address, "path": holders.iter().find_map(|f| f.account.path.clone()),
         "label": label, "labels": (!labels.is_empty()).then_some(labels),
         "wallet": wallet(holders, origin_of),
-        "holders": holders.iter().map(holder_json).collect::<Vec<_>>(),
+        "holders": holders.iter().map(|f| {
+            let mut h = holder_json(f);
+            h["apps"] = openers_of(&f.name).into();
+            h
+        }).collect::<Vec<_>>(),
     })
 }
 
-/// A holder as apps see it: public, and no xpub.
+/// A holder as apps see it: public, and no xpub. `opens` says it can give a Bitcoin account's open
+/// key; an account that `opensByPassword` opens only by the Bitcoin app's password.
 pub fn holder_json(f: &Found) -> serde_json::Value {
     serde_json::json!({
         "signer": f.name, "accountId": f.account.id, "kind": f.info.kind, "model": f.info.model,
         "transport": transport(f), "presence": presence(f), "available": f.account.available,
         "collects": f.info.collects, "showsRequest": f.info.shows_request, "requestKinds": f.info.request_kinds,
+        "opens": f.info.wallet_key && !f.account.opens_by_password, "opensByPassword": f.account.opens_by_password,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::bip32::Xpub;
     use logos_signer_interface::{Chain, Collects, SignerInfo};
+    use std::str::FromStr;
 
     pub fn found(signer: usize, name: &str, kind: &str, account: Account) -> Found {
         Found {
@@ -172,6 +183,7 @@ mod tests {
                 request_kinds: vec![],
                 shows_request: false,
                 collects: Collects::Nothing,
+                wallet_key: false,
             },
             account,
         }
@@ -188,6 +200,8 @@ mod tests {
             xpub: None,
             label: None,
             available,
+            key: None,
+            opens_by_password: false,
         }
     }
 
@@ -198,8 +212,10 @@ mod tests {
 
     #[test]
     fn a_bitcoin_account_is_its_key_not_its_xpubs_metadata() {
-        let (_, a, _) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
+        let (_, mut a, _) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
         assert_eq!(a.chain, Some(Chain::Test));
+        let listed = a.key.take();
+        assert_eq!(key_of(&a), listed, "the key a signer lists is the one its xpub gives");
         let mut other = Xpub::from_str(a.xpub.as_deref().unwrap()).unwrap();
         other.parent_fingerprint = Default::default();
         let mut b = a.clone();
@@ -209,6 +225,12 @@ mod tests {
         assert!(key_of(&a).unwrap().starts_with("btc_") && key_of(&a).unwrap().len() == 36);
         b.family = Family::BitcoinTaproot;
         assert_ne!(key_of(&a), key_of(&b), "the same key under another script is another account");
+        // A signer that lists no xpub is known by the key it lists; a malformed one is ignored.
+        let (key, mut c) = (listed.clone().unwrap(), a.clone());
+        (c.xpub, c.key) = (None, Some(key.to_ascii_uppercase().replace("BTC_", "btc_")));
+        assert_eq!(key_of(&c), listed);
+        c.key = Some("btc_nothex".into());
+        assert_eq!(key_of(&c), None);
     }
 
     #[test]
@@ -255,9 +277,11 @@ mod tests {
     fn a_roster_entry_carries_no_xpub() {
         let (_, mut a, _) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
         a.label = Some("Savings".into());
-        let e = entry_json("btc_1", &[found(0, "keystore_module", "keystore", a)], |_| None);
+        let apps = |s: &str| if s == "keystore_module" { vec!["evm_keystore_ui".to_string()] } else { Vec::new() };
+        let e = entry_json("btc_1", &[found(0, "keystore_module", "keystore", a)], |_| None, apps);
         assert!(!e.to_string().contains("pub"), "{e}");
         assert_eq!((e["label"].as_str(), e["holders"][0]["transport"].as_str()), (Some("Savings"), Some("keystore")));
+        assert_eq!(e["holders"][0]["apps"], serde_json::json!(["evm_keystore_ui"]));
         assert_eq!(e["path"], "m/84'/1'/0'");
         assert!(e["labels"].is_null());
     }

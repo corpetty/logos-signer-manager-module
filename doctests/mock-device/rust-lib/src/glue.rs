@@ -20,9 +20,14 @@ pub trait MockDeviceSignerModule: Send + Sync + 'static {
     fn sign_status(&self, job: String) -> String;
     fn sign_result(&self, job: String) -> String;
     fn cancel_sign(&self, job: String) -> String;
+    // A real signer admits only the manager here; this fixture admits anyone.
+    fn wallet_key(&self, request_json: String) -> String;
+    fn wallet_key_status(&self, job: String) -> String;
+    fn wallet_key_result(&self, job: String) -> String;
+    fn cancel_wallet_key(&self, job: String) -> String;
 
     // ── the device itself, for tests ────────────────────────────────────
-    /// What the device shows: `{ ok, waiting: [{ job, account, kind, items }] }`.
+    /// What the device shows: `{ ok, waiting: [{ job, account, kind, items }], opening: [job] }`.
     fn screen(&self) -> String;
     /// The person presses `confirm` or `refuse` on the device for `job`.
     fn press(&self, job: String, button: String) -> String;
@@ -89,6 +94,22 @@ impl MockDeviceSignerModule for MockDeviceSignerModuleImpl {
         signer_json::cancel_sign(&mut *self.device(), &job)
     }
 
+    fn wallet_key(&self, request_json: String) -> String {
+        signer_json::wallet_key(&mut *self.device(), &request_json)
+    }
+
+    fn wallet_key_status(&self, job: String) -> String {
+        signer_json::wallet_key_status(&mut *self.device(), &job)
+    }
+
+    fn wallet_key_result(&self, job: String) -> String {
+        signer_json::wallet_key_result(&mut *self.device(), &job)
+    }
+
+    fn cancel_wallet_key(&self, job: String) -> String {
+        signer_json::cancel_wallet_key(&mut *self.device(), &job)
+    }
+
     fn screen(&self) -> String {
         let waiting: Vec<Value> = self
             .device()
@@ -102,16 +123,19 @@ impl MockDeviceSignerModule for MockDeviceSignerModuleImpl {
                 json!({ "job": job, "account": req.account, "kind": req.payload.kind(), "items": items })
             })
             .collect();
-        json!({ "ok": true, "waiting": waiting }).to_string()
+        json!({ "ok": true, "waiting": waiting, "opening": self.device().waiting_keys() }).to_string()
     }
 
     fn press(&self, job: String, button: String) -> String {
+        // An open key's job id is never announced; the manager looks for it.
+        let opening = self.device().waiting_keys().contains(&job);
         let pressed = match button.as_str() {
             "confirm" => self.device().confirm(&job),
             "refuse" => self.device().refuse(&job),
             _ => return err("press confirm or refuse"),
         };
         match pressed {
+            Ok(()) if opening => json!({ "ok": true, "job": job }).to_string(),
             Ok(()) => {
                 emit_sign_progress(&job, if button == "confirm" { "done" } else { "failed" });
                 json!({ "ok": true, "job": job }).to_string()
