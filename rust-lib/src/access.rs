@@ -540,7 +540,22 @@ impl Access {
         }
         let requester = r.requester.clone();
         let password = Zeroizing::new(decision.password);
-        if let (Kind::Open(p), Some(name)) = (&r.kind, decision.signer.as_deref()) {
+        let via = match (&r.kind, decision.signer) {
+            (_, Some(name)) => Some(name),
+            // A keystore that keeps its xpub sealed opens by its key too, behind its password.
+            (Kind::Open(p), None) if gate.custodian => p
+                .group
+                .as_ref()
+                .or(decision.group.as_ref())
+                .and_then(|g| signers.find(g).ok())
+                .filter(|f| f.name == KEYSTORE && f.account.xpub.is_none() && f.info.wallet_key)
+                .map(|f| f.name),
+            _ => None,
+        };
+        if let (Kind::Open(p), Some(name)) = (&r.kind, via.as_deref()) {
+            if decision.birthday.is_some() {
+                return Err(bad("approve_access: a wallet opened by its key takes no birthday; its app asks for one"));
+            }
             let group = match (&p.group, &decision.group) {
                 (Some(asked), Some(picked)) if asked != picked => {
                     return Err(bad("approve_access: this request names its wallet"));
@@ -1449,5 +1464,29 @@ pub(crate) mod tests {
         assert!(a.fetch(&h, &r).is_err());
         let p = a.progress_of(&mut s, &mut k, &h, &keycard_ui).unwrap();
         assert!(p["error"].as_str().unwrap().contains("another wallet's xpub"), "{p}");
+    }
+
+    #[test]
+    fn the_keys_app_opens_a_keystore_wallet_that_keeps_its_xpub_sealed_by_its_key() {
+        let mut s = Registry::new();
+        let opts = MockOptions { collects: Collects::Password, secret: "pw".into(), list_xpub: false, ..Default::default() };
+        s.add("keystore_module", Box::new(MockSigner::new(opts)));
+        let (mut k, mut a) = (FakeKeys::default(), Access::new());
+        let ask = r#"{"group":"mock-segwit","network":"regtest","unlock":{"ttlMs":60000}}"#;
+        let (h, r) = a.request_open(&mut s, "wallet_core", ask).unwrap();
+        let shown = a.acknowledge(&mut s, &h, &keys_app()).unwrap();
+        assert_eq!(shown.holders.len(), 1, "the keys app opens with the keystore");
+        let wrong = a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "nope", None), &keys_app()).unwrap_err();
+        assert_eq!(wrong.wire_code().as_deref(), Some("wrong_secret"));
+        let dated = Decision { birthday: Some("2021-11-14".into()), ..decide(None, "pw", None) };
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, dated, &keys_app()).is_err());
+        let opened = a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None), &keys_app());
+        assert_eq!(opened.unwrap(), Approved::Settled);
+        let got = a.fetch(&h, &r).unwrap();
+        assert_eq!(got["signer"], "keystore_module");
+        assert_ne!(got["databaseKey"], "ab".repeat(32), "the key's, not the keystore's stored one");
+        assert!(got["external"].as_str().unwrap().starts_with("wpkh(["));
+        assert_eq!(a.covers("mock-segwit", "wallet_core"), Cover::Confirmed, "the app's terms, granted");
+        assert_eq!(k.unlocks.len(), 1);
     }
 }

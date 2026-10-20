@@ -262,7 +262,9 @@ wallet for it in the keys app, and an account stays unlocked only on terms a per
   open settles `rejected`; cancelled by the requester, the device stops asking. An app the roles
   don't list for a holder is refused (`not authorized`), and naming no `signer` is the custodian's
   path alone. Opens that name no wallet, and unlocks, stay with the keys app. The manager keeps
-  neither the open key nor the xpub once the open settles.
+  neither the open key nor the xpub once the open settles. A keystore that lists no xpub opens
+  this way too when the keys app approves without naming a holder, behind the account's password.
+  An open by key takes no `birthday`: the wallet's app asks for one.
 - The custodian (the keys app) works the queue with `access_requests`, `acknowledge_access` (the
   lines to show, the commitment to echo, and `asked`: the wallet or the family and network to pick
   from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?, signer?,
