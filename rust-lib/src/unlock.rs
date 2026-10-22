@@ -423,6 +423,16 @@ impl Unlock {
             .map(|s| s.id.clone())
     }
 
+    /// The seed a caller names: one of the manager's, or, from one of its holders, the seed as
+    /// that holder names it.
+    pub fn resolve(&self, caller: &str, named: &str) -> String {
+        let named = named.trim();
+        if named == PROFILE || self.seeds.iter().any(|s| s.id == named) {
+            return named.to_string();
+        }
+        self.seed_of(caller, named).unwrap_or_else(|| named.to_string())
+    }
+
     pub fn is_unlocked(&self, seed: &str) -> bool {
         self.open.contains_key(seed.trim())
     }
@@ -1055,6 +1065,11 @@ mod tests {
         assert_eq!(s.holders(&card.seed).unwrap().len(), 2);
         assert_eq!(s.seed_of("keycard_shell_module", "mkid").as_deref(), Some(card.seed.as_str()));
         assert_eq!(s.wallets()[0].name, "Card", "the first name stays");
+        // Each holder may name the seed its own way, and nobody else's.
+        assert_eq!(s.resolve("keycard_shell_module", "mkid"), card.seed);
+        assert_eq!(s.resolve("keycard_module", "uid"), card.seed);
+        assert_eq!(s.resolve("keycard_module", "mkid"), "mkid");
+        assert_eq!(s.resolve("anyone", &card.seed), card.seed);
         let other = s.enroll(holder("keycard_shell_module", "mkid2"), Some(&u(3)), "Other", About::default()).unwrap();
         assert!(other.new);
     }

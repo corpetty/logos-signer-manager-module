@@ -230,7 +230,8 @@ restart or a `lock_wallets`.
   been photographed.
 - **The seed key** is random, one per seed, with a generation. A module's key is
   `HKDF-SHA256(seed key, "logos/data/v1", module ‖ 0 ‖ scope ‖ 0 ‖ generation)`; `data_key({ seed,
-  scope, generation? })` answers it to the caller, named by its identity, or `locked`. The current
+  scope, generation? })` answers it to the caller, named by its identity, or `locked`. A holder
+  of the seed may name it its own way, as it lists it in `seed`. The current
   generation is the default; an earlier one still answers, so a module reads its old data and
   writes it again under the new key in its own time. `"profile"` instead of a seed is a key for
   data of no wallet, such as contacts: any unlocked wallet opens it.

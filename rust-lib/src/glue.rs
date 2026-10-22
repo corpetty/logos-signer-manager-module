@@ -1141,7 +1141,8 @@ impl Core {
             Ok(w) => w,
             Err(e) => return err(format!("data_key: {e}")),
         };
-        match self.wallets.store.data_key(&module, &w.seed, &w.scope, w.generation) {
+        let seed = self.wallets.store.resolve(&module, &w.seed);
+        match self.wallets.store.data_key(&module, &seed, &w.scope, w.generation) {
             Ok((key, generation)) => {
                 let key = Zeroizing::new(hex::encode(&key[..]));
                 json!({ "ok": true, "key": key.as_str(), "generation": generation }).to_string()
