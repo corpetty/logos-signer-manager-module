@@ -3034,10 +3034,11 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "logos-signer-interface"
 version = "0.1.0"
-source = "git+https://github.com/logos-co/logos-signer-interface?rev=752b7bd69a79ead110efccab40a64731535187f5#752b7bd69a79ead110efccab40a64731535187f5"
+source = "git+https://github.com/logos-co/logos-signer-interface?rev=eab22d1a990adfb973aa8669175e366d28cf0803#eab22d1a990adfb973aa8669175e366d28cf0803"
 dependencies = [
  "bip32",
  "bitcoin",
+ "chacha20poly1305",
  "hex",
  "k256",
  "pbkdf2",
