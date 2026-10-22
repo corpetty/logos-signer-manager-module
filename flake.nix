@@ -5,7 +5,7 @@
     logos-module-builder.url = "github:logos-co/logos-module-builder";
     # The signer interface's contract, bound at runtime to each signer module by name.
     logos-signer-interface = {
-      url = "github:logos-co/logos-signer-interface/a2e3dc51f9ca5dcde0a9fe8d3d1e620c8d689cb0";
+      url = "github:logos-co/logos-signer-interface/752b7bd69a79ead110efccab40a64731535187f5";
       flake = false;
     };
     # The first signer: the key files. A dependency, so it loads with the manager.

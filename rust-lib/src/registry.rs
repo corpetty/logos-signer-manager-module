@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use logos_signer_interface::walletkey::{evm_path_ok, is_reserved};
+use logos_signer_interface::unlock::{evm_path_ok, is_reserved};
 use logos_signer_interface::{Account, Family, Signer, SignerInfo};
 
 use crate::error::{ManagerError, Result};
@@ -263,7 +263,7 @@ mod tests {
                 request_kinds: Vec::new(),
                 shows_request: false,
                 collects: Collects::Nothing,
-                wallet_key: false,
+                unlock_key: false,
             }
         }
         fn accounts(&mut self) -> logos_signer_interface::Result<Vec<Account>> {

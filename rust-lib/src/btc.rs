@@ -401,7 +401,7 @@ pub(crate) mod tests {
             label: None,
             available: true,
             key: None,
-            opens_by_password: false,
+            seed: None,
         };
         assert_eq!(AccountPublic::from_account(&listed).unwrap(), public);
         for broken in [

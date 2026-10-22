@@ -19,14 +19,9 @@ byte what the keystore returned when it signed itself.
 `accounts` lists every signer's accounts, without xpubs, each under one holder. `roster` lists each
 account once with every signer that holds it, ranked: the keystore, connected devices, QR wallets,
 then unplugged devices. Apps pick accounts from it. `signers` says which signer modules are
-consulted. `configure` names the approvers, the custodians, the signers and each signer's openers.
-Unconfigured, it consults the keystore, then the Keycard Shell's, the Keycard's and the QR signer's
-modules when they are installed. Those three are optional dependencies, so installed ones load with
-the manager.
-
-A Bitcoin wallet opens through one of its holders: the keys app for the keystore, the Keycard app
-for a card or the Shell, QR Wallets for a QR wallet. The holder gives the wallet's open key, and the
-database key comes from it, the same from every holder of the seed.
+consulted. `configure` names the approvers, the custodians and the signers. Unconfigured, it consults
+the keystore, then the Keycard Shell's, the Keycard's and the QR signer's modules when they are
+installed. Those three are optional dependencies, so installed ones load with the manager.
 
 See [`docs/specs.md`](docs/specs.md) for the reference, and
 [`doctests/signer-manager-runtime.test.yaml`](doctests/signer-manager-runtime.test.yaml) for the

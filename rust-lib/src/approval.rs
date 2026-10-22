@@ -68,7 +68,7 @@ pub struct Intent {
     pub purpose: String,
     pub legs: Vec<Leg>,
     /// The Bitcoin wallet's xpub, from the requester that has it open: checked against the
-    /// account's roster key, used for this request only. A signer that still lists it needs none.
+    /// account's roster key, used for this request only.
     #[serde(default)]
     pub xpub: String,
 }
@@ -587,7 +587,7 @@ impl Approvals {
             account: found.account.id.clone(),
             payload: payload_for(&r.intent, &prepared, &found.info)?,
             secret: (!secret.is_empty() && found.info.collects != logos_signer_interface::Collects::Nothing).then(|| Secret::new(secret)),
-            // A Bitcoin request carries the xpub the signer keeps sealed; it checks it itself too.
+            // A Bitcoin request carries the account's xpub; the signer checks it against the account too.
             xpub: match &prepared {
                 Prepared::Psbt { found, .. } => found.account.xpub.clone(),
                 Prepared::Evm { .. } => None,
@@ -796,7 +796,7 @@ fn with_brought_xpub(account: &logos_signer_interface::Account, intent: &Intent)
         return Ok(account.clone());
     }
     let key = roster::key_of(account).ok_or_else(|| bad("intent: this wallet has no roster key to check its xpub"))?;
-    logos_signer_interface::walletkey::check_xpub(&key, account.family, account.chain, brought)
+    logos_signer_interface::unlock::check_xpub(&key, account.family, account.chain, brought)
         .map_err(|_| bad("intent: the xpub is not this wallet's"))?;
     Ok(logos_signer_interface::Account { xpub: Some(brought.to_string()), ..account.clone() })
 }
@@ -1452,8 +1452,8 @@ mod tests {
     #[test]
     fn a_bitcoin_request_brings_its_wallets_xpub_checked_and_kept_for_that_request_only() {
         let mut s = Registry::new();
-        let opts = MockOptions { collects: Collects::Password, secret: "pw".into(), list_xpub: false, ..Default::default() };
-        s.add("keystore_module", Box::new(MockSigner::new(opts)));
+        let opts = MockOptions { collects: Collects::Password, secret: "pw".into(), ..Default::default() };
+        s.add("keystore_module", Box::new(NoXpub(MockSigner::new(opts))));
         let mut ap = Approvals::new();
         let (_, listed, acct) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
         let (_, _, taproot) = crate::psbt::tests::ours(crate::btc::Family::Taproot);
@@ -1482,6 +1482,30 @@ mod tests {
         let two = psbt_intent(&listed.id, &psbt).replace("}]}", r#"},{"kind":"message","text":"x"}]}"#);
         assert!(ap.request(&mut s, "x", &two).is_err());
         assert!(ap.request(&mut s, "x", &psbt_intent(ACCT0, &psbt)).is_err(), "an EVM account is no wallet");
+    }
+
+    /// A signer that lists its Bitcoin accounts without their xpubs.
+    struct NoXpub(MockSigner);
+
+    impl Signer for NoXpub {
+        fn info(&self) -> SignerInfo {
+            self.0.info()
+        }
+        fn accounts(&mut self) -> logos_signer_interface::Result<Vec<logos_signer_interface::Account>> {
+            Ok(self.0.accounts()?.into_iter().map(|a| logos_signer_interface::Account { xpub: None, ..a }).collect())
+        }
+        fn sign(&mut self, request: SignRequest) -> logos_signer_interface::Result<String> {
+            self.0.sign(request)
+        }
+        fn status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+            self.0.status(job)
+        }
+        fn result(&mut self, job: &str) -> logos_signer_interface::Result<Vec<Signature>> {
+            self.0.result(job)
+        }
+        fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+            self.0.cancel(job)
+        }
     }
 
     /// A signer that answers with signatures over something else.

@@ -2,7 +2,7 @@
 //! Bitcoin wallet is `g_…` in the keystore, `keycard-…` on a card), so holders are grouped by what
 //! the account is: its address, or a Bitcoin account's key.
 
-use logos_signer_interface::walletkey::roster_key;
+use logos_signer_interface::unlock::roster_key;
 use logos_signer_interface::{Account, Family};
 use serde::Serialize;
 
@@ -13,7 +13,7 @@ pub const KEYSTORE: &str = "keystore_module";
 
 /// What makes two signers' accounts one: an EVM address without case, or a Bitcoin account's roster
 /// key (`btc_` and 32 hex of a hash over its family, chain, chain code and key), as its signer lists
-/// it or, from a signer that still lists xpubs, worked out from the xpub.
+/// it or worked out from its xpub.
 pub fn key_of(a: &Account) -> Option<String> {
     if a.family == Family::Evm {
         let address = a.address.as_deref().unwrap_or(&a.id).trim();
@@ -130,14 +130,9 @@ pub fn wallet(holders: &[Found], origin_of: impl Fn(&Found) -> Option<serde_json
     serde_json::json!({ "fingerprint": fingerprint, "name": name })
 }
 
-/// One account of `roster()`: what it is, its names, its wallet and every holder, ranked, with the
-/// apps that open it through each. Public, and no xpub: it would show a Bitcoin wallet's whole history.
-pub fn entry_json(
-    key: &str,
-    holders: &[Found],
-    origin_of: impl Fn(&Found) -> Option<serde_json::Value>,
-    openers_of: impl Fn(&str) -> Vec<String>,
-) -> serde_json::Value {
+/// One account of `roster()`: what it is, its names, its wallet and every holder, ranked. Public,
+/// and no xpub: it would show a Bitcoin wallet's whole history.
+pub fn entry_json(key: &str, holders: &[Found], origin_of: impl Fn(&Found) -> Option<serde_json::Value>) -> serde_json::Value {
     let Some(first) = holders.first() else { return serde_json::Value::Null };
     let (label, labels) = names(holders);
     serde_json::json!({
@@ -145,22 +140,16 @@ pub fn entry_json(
         "address": first.account.address, "path": holders.iter().find_map(|f| f.account.path.clone()),
         "label": label, "labels": (!labels.is_empty()).then_some(labels),
         "wallet": wallet(holders, origin_of),
-        "holders": holders.iter().map(|f| {
-            let mut h = holder_json(f);
-            h["apps"] = openers_of(&f.name).into();
-            h
-        }).collect::<Vec<_>>(),
+        "holders": holders.iter().map(holder_json).collect::<Vec<_>>(),
     })
 }
 
-/// A holder as apps see it: public, and no xpub. `opens` says it can give a Bitcoin account's open
-/// key; an account that `opensByPassword` opens only by the Bitcoin app's password.
+/// A holder as apps see it: public, and no xpub.
 pub fn holder_json(f: &Found) -> serde_json::Value {
     serde_json::json!({
         "signer": f.name, "accountId": f.account.id, "kind": f.info.kind, "model": f.info.model,
         "transport": transport(f), "presence": presence(f), "available": f.account.available,
         "collects": f.info.collects, "showsRequest": f.info.shows_request, "requestKinds": f.info.request_kinds,
-        "opens": f.info.wallet_key && !f.account.opens_by_password, "opensByPassword": f.account.opens_by_password,
     })
 }
 
@@ -183,7 +172,7 @@ mod tests {
                 request_kinds: vec![],
                 shows_request: false,
                 collects: Collects::Nothing,
-                wallet_key: false,
+                unlock_key: false,
             },
             account,
         }
@@ -201,7 +190,7 @@ mod tests {
             label: None,
             available,
             key: None,
-            opens_by_password: false,
+            seed: None,
         }
     }
 
@@ -277,11 +266,9 @@ mod tests {
     fn a_roster_entry_carries_no_xpub() {
         let (_, mut a, _) = crate::psbt::tests::ours(crate::btc::Family::Segwit);
         a.label = Some("Savings".into());
-        let apps = |s: &str| if s == "keystore_module" { vec!["evm_keystore_ui".to_string()] } else { Vec::new() };
-        let e = entry_json("btc_1", &[found(0, "keystore_module", "keystore", a)], |_| None, apps);
+        let e = entry_json("btc_1", &[found(0, "keystore_module", "keystore", a)], |_| None);
         assert!(!e.to_string().contains("pub"), "{e}");
         assert_eq!((e["label"].as_str(), e["holders"][0]["transport"].as_str()), (Some("Savings"), Some("keystore")));
-        assert_eq!(e["holders"][0]["apps"], serde_json::json!(["evm_keystore_ui"]));
         assert_eq!(e["path"], "m/84'/1'/0'");
         assert!(e["labels"].is_null());
     }

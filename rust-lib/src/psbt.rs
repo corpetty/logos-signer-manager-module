@@ -429,7 +429,7 @@ pub(crate) mod tests {
             label: None,
             available: true,
             key: None,
-            opens_by_password: false,
+            seed: None,
         };
         AccountPublic::from_account(&listed).unwrap()
     }
