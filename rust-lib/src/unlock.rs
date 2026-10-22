@@ -334,6 +334,11 @@ impl Unlock {
         Self::default()
     }
 
+    /// Before the module knows where its files are: everything is refused.
+    pub fn not_ready() -> Self {
+        Unlock { broken: Some("the module has not started yet".into()), ..Default::default() }
+    }
+
     /// The store in `dir`. Files that can't be read leave it refusing everything, so nothing
     /// overwrites them.
     pub fn load(dir: PathBuf) -> Self {

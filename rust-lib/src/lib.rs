@@ -7,6 +7,7 @@
 
 pub mod access;
 pub mod unlock;
+pub mod wallets;
 pub mod approval;
 pub mod btc;
 pub mod error;

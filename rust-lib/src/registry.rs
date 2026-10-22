@@ -43,7 +43,7 @@ fn same_id(a: &Account, id: &str) -> bool {
     }
 }
 
-/// Nothing under the reserved purpose, where open keys live, and an EVM account under m/44'/60':
+/// Nothing under the reserved purpose, where unlock keys live, and an EVM account under m/44'/60':
 /// a listing that says otherwise was edited, and the account is not offered.
 fn admissible(a: &Account) -> bool {
     match a.path.as_deref() {
