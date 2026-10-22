@@ -110,7 +110,7 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `signers` | — | `{ ok, signers: [{ name, info? }] }` |
 | `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, signers }`: everything a total `configure` must repeat |
 | `request_open`, `request_unlock` | `params_json` | `{ ok, handle, receipt, state }` |
-| `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }`; opens only, for an approver |
+| `access_requests` | — | `{ ok, requests: [{ handle, requester, kind, state, ageMs, seed }] }`; opens only, for an approver |
 | `acknowledge_access` | `handle` | `{ ok, handle, requester, kind, bundle_id, lines, asked, seed }` |
 | `approve_access` | `params_json` | `{ ok }`, or `{ ok: false, code, error }` |
 | `reject_access` | `handle` | `bool` |
@@ -124,7 +124,7 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `wallets` | — | `{ ok, wallets: [{ seed, name, locked, kinds, privateName? }] }` |
 | `data_key` | `params_json` | `{ ok, key, generation }`, or `{ ok: false, code: "locked" }` |
 | `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked }` |
-| `wallet_settings` | — | `{ ok, wallets: [{ seed, name, privateName?, locked, holders, index, generation, ways, origin?, birthday? }], passwords: [{ id, name, wallets }] }` |
+| `wallet_settings` | — | `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device, index, generation, ways, origin?, birthday? }], passwords: [{ id, name, wallets }] }`; `device`: its holders give an unlock key |
 | `unlock_wallet`, `set_rule`, `change_keys` | `params_json` | `{ ok, state: "done" }`, or `{ ok, state: "device", handle }`, or `{ ok: false, code, error }` |
 | `unlock_progress` | `handle` | `{ ok, state, seed, step?, code?, error? }` |
 | `cancel_unlock` | `handle` | `bool` |

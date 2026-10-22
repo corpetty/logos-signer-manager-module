@@ -84,8 +84,8 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// Ask for an account to stay unlocked: `{ account, ttlMs?, count?, apps?, confirm?, reason? }`
     /// → `{ ok, handle, receipt, state }`. The person decides the terms. Tier B.
     fn request_unlock(&self, params_json: String) -> String;
-    /// The queue: `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }`; an approver sees
-    /// opens only. Approvers and the custodian.
+    /// The queue: `{ ok, requests: [{ handle, requester, kind, state, ageMs, seed }] }`, `seed` the
+    /// wallet an open names when known; an approver sees opens only. Approvers and the custodian.
     fn access_requests(&self) -> String;
     /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked, seed }`.
     /// `asked` is `{ group, family, network, unlock, seed }` for an open and `{ account, terms }` for
@@ -128,9 +128,10 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// gives one: `{ seed, kind, unlockKey?, name, origin?, birthday? }` → `{ ok, seed, new,
     /// unlocked }`. `seed` in is the signer's own name for it. The configured signers only.
     fn enroll_seed(&self, params_json: String) -> String;
-    /// The Signer app's view: `{ ok, wallets: [{ seed, name, privateName?, locked, holders, index,
-    /// generation, ways: [{ id, factors: [{ kind, id?, name? }] }], origin?, birthday? }],
-    /// passwords: [{ id, name, wallets }] }`. Approvers.
+    /// The Signer app's view: `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device,
+    /// index, generation, ways: [{ id, factors: [{ kind, id?, name? }] }], origin?, birthday? }],
+    /// passwords: [{ id, name, wallets }] }`. `device`: its holders give an unlock key, so a way
+    /// may take the device. Approvers.
     fn wallet_settings(&self) -> String;
     /// Unlock a wallet by one of its ways in: `{ seed, way, holder?, secret?, passwords? }`, or `{
     /// handle, passwords }` to type a password again → `{ ok, state: "done" }`, or `{ ok, state:
@@ -859,12 +860,13 @@ impl Core {
         let Some((_, role)) = self.access_gate() else {
             return not_authorized();
         };
+        self.refresh();
         let list: Vec<_> = self
             .access
-            .queue(role)
+            .queue(&mut self.signers, &self.wallets.store, role)
             .into_iter()
             .map(|q| json!({ "handle": q.handle, "requester": q.requester, "kind": q.kind, "state": q.state,
-                             "ageMs": q.age_ms as u64 }))
+                             "ageMs": q.age_ms as u64, "seed": q.seed }))
             .collect();
         json!({ "ok": true, "requests": list }).to_string()
     }
@@ -1225,8 +1227,8 @@ impl Core {
                     .map(|(id, factors)| json!({ "id": id, "factors": factors.iter().map(factor).collect::<Vec<_>>() }))
                     .collect();
                 json!({ "seed": w.seed, "name": w.name, "privateName": w.about.private_name, "locked": w.locked,
-                        "holders": w.holders, "index": w.index, "generation": w.generation, "ways": ways,
-                        "origin": w.about.origin, "birthday": w.about.birthday })
+                        "holders": w.holders, "device": w.device, "index": w.index, "generation": w.generation,
+                        "ways": ways, "origin": w.about.origin, "birthday": w.about.birthday })
             })
             .collect();
         let passwords: Vec<_> = store

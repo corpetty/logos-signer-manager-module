@@ -248,6 +248,8 @@ pub struct Summary {
     pub kind: &'static str,
     pub state: &'static str,
     pub age_ms: u128,
+    /// The wallet an open names, when the manager knows it: the Signer app lists it there.
+    pub seed: Option<String>,
 }
 
 #[derive(Default)]
@@ -433,7 +435,16 @@ impl Access {
         Ok(self.push(requester, Kind::Unlock(p), lines))
     }
 
-    pub fn queue(&mut self, role: Role) -> Vec<Summary> {
+    /// The wallet an open names: the seed it brings, if the manager knows it, else its group's.
+    fn seed_of(r: &Record, signers: &mut Registry, wallets: &Unlock) -> Option<String> {
+        let Kind::Open(p) = &r.kind else { return None };
+        p.seed.clone().filter(|s| wallets.holders(s).is_ok()).or_else(|| {
+            let found = signers.find(p.group.as_deref()?).ok()?;
+            wallets.seed_of(&found.name, found.account.seed.as_deref()?)
+        })
+    }
+
+    pub fn queue(&mut self, signers: &mut Registry, wallets: &Unlock, role: Role) -> Vec<Summary> {
         self.sweep();
         let now = Instant::now();
         self.records
@@ -441,6 +452,7 @@ impl Access {
             .filter(|r| !matches!(r.state, State::Settled(_)))
             .filter(|r| role == Role::Custodian || matches!(r.kind, Kind::Open(_)))
             .map(|r| Summary {
+                seed: Self::seed_of(r, signers, wallets),
                 handle: r.handle.clone(),
                 requester: r.requester.clone(),
                 kind: match r.kind {
@@ -464,13 +476,7 @@ impl Access {
                 r.state = State::Offered;
             }
         }
-        let seed = match &self.records[idx].kind {
-            Kind::Open(p) => p.seed.clone().filter(|s| wallets.holders(s).is_ok()).or_else(|| {
-                let found = signers.find(p.group.as_deref()?).ok()?;
-                wallets.seed_of(&found.name, found.account.seed.as_deref()?)
-            }),
-            Kind::Unlock(_) => None,
-        };
+        let seed = Self::seed_of(&self.records[idx], signers, wallets);
         let r = &mut self.records[idx];
         if let State::Settled(o) = r.state {
             return Err(bad(format!("already settled: {o}")));
@@ -1120,6 +1126,7 @@ pub(crate) mod tests {
         let (mut s, mut w, seed, key) = enrolled();
         let mut a = Access::new();
         let (h, r) = a.request_open(&mut s, &w, "bitcoin_wallet_core_module", OPEN).unwrap();
+        assert_eq!(a.queue(&mut s, &w, Role::Approver)[0].seed.as_deref(), Some(seed.as_str()), "listed under its wallet");
         let shown = a.acknowledge(&mut s, &w, &h, &SIGNER).unwrap();
         assert_eq!(shown.seed.as_deref(), Some(seed.as_str()), "shown beside its wallet");
         let locked = a.consent(&mut s, &w, &h, &shown.bundle_id, None, &SIGNER).unwrap_err();
@@ -1167,8 +1174,8 @@ pub(crate) mod tests {
         // Only the keystore's accounts unlock for signing.
         let (mut ks, _, _) = fixture();
         let (h, _) = a.request_unlock(&mut ks, "game", r#"{"account":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"}"#).unwrap();
-        assert!(a.queue(Role::Approver).iter().all(|q| q.handle != h), "unlocks stay with the keys app");
-        assert!(a.queue(Role::Custodian).iter().any(|q| q.handle == h));
+        assert!(a.queue(&mut ks, &w, Role::Approver).iter().all(|q| q.handle != h), "unlocks stay with the keys app");
+        assert!(a.queue(&mut ks, &w, Role::Custodian).iter().any(|q| q.handle == h));
         assert!(matches!(a.acknowledge(&mut ks, &w, &h, &SIGNER), Err(ManagerError::Refused(_))));
     }
 

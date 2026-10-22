@@ -268,6 +268,8 @@ pub struct WalletView {
     pub name: String,
     pub locked: bool,
     pub holders: Vec<Holder>,
+    /// Its holders give an unlock key: a way in may take the device.
+    pub device: bool,
     pub index: u32,
     pub generation: u32,
     pub ways: Vec<(String, Vec<Factor>)>,
@@ -659,6 +661,7 @@ impl Unlock {
                 name: s.name.clone(),
                 locked: !self.open.contains_key(&s.id),
                 holders: s.holders.clone(),
+                device: s.identity.is_some(),
                 index: s.index,
                 generation: s.generation,
                 ways: s.ways.iter().map(|w| (w.id.clone(), w.factors.clone())).collect(),
@@ -1011,7 +1014,7 @@ mod tests {
         let dir = Dir::new();
         let mut s = dir.store();
         let e = s.enroll(holder("keycard_module", "uid1"), Some(&u(1)), "Card", About::default()).unwrap();
-        assert!(e.new && e.unlocked);
+        assert!(e.new && e.unlocked && s.wallets()[0].device);
         let (k, g) = s.data_key("bitcoin_wallet_core_module", &e.seed, "wallet/btc_1", None).unwrap();
         assert_eq!(g, 0);
         assert_eq!(s.lock(None), 1);
@@ -1181,7 +1184,7 @@ mod tests {
         let dir = Dir::new();
         let mut s = dir.store();
         let e = s.enroll(holder("qr_signer_module", "keystone-fp"), None, "Keystone", About::default()).unwrap();
-        assert!(e.unlocked);
+        assert!(e.unlocked && !s.wallets()[0].device, "no way can take its device");
         let pw = s.create_password("QR", "pw-qr").unwrap();
         assert!(s.set_rule(&e.seed, &[vec![Factor::Device]], &device(1)).is_err(), "it gives no unlock key");
         s.set_rule(&e.seed, &[vec![Factor::Password(pw.clone())]], &typed(&[(&pw, "pw-qr")])).unwrap();
