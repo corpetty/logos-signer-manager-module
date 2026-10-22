@@ -6,6 +6,7 @@
 //! behind the `logos_module` feature, which the builder turns on.
 
 pub mod access;
+pub mod unlock;
 pub mod approval;
 pub mod btc;
 pub mod error;
