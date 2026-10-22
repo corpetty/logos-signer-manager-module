@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use rand::RngCore;
@@ -65,9 +65,8 @@ fn cipher(key: &[u8; 32]) -> XChaCha20Poly1305 {
 
 /// `nonce ‖ ciphertext`, as hex.
 fn seal(key: &[u8; 32], plain: &[u8], aad: &[u8]) -> String {
-    let mut nonce = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let ct = cipher(key).encrypt(&XNonce::from(nonce), Payload { msg: plain, aad }).expect("encrypting in memory");
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut chacha20poly1305::aead::OsRng);
+    let ct = cipher(key).encrypt(&nonce, Payload { msg: plain, aad }).expect("encrypting in memory");
     let mut out = nonce.to_vec();
     out.extend(ct);
     hex::encode(out)
