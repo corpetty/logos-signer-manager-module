@@ -1132,7 +1132,10 @@ impl Core {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
+            #[serde(default)]
             seed: String,
+            #[serde(default)]
+            account: Option<String>,
             scope: String,
             #[serde(default)]
             generation: Option<u32>,
@@ -1141,11 +1144,21 @@ impl Core {
             Ok(w) => w,
             Err(e) => return err(format!("data_key: {e}")),
         };
-        let seed = self.wallets.store.resolve(&module, &w.seed);
+        let seed = match (&w.account, w.seed.trim().is_empty()) {
+            (Some(account), true) => match self.signers.seed_of_account(account) {
+                Some((holder, named)) => match self.wallets.store.seed_of(&holder, &named) {
+                    Some(seed) => seed,
+                    None => return json!({ "ok": false, "code": "unavailable", "error": "data_key: this account's wallet isn't known yet" }).to_string(),
+                },
+                None => return json!({ "ok": false, "code": "unavailable", "error": "data_key: no signer lists this account" }).to_string(),
+            },
+            (None, false) => self.wallets.store.resolve(&module, &w.seed),
+            _ => return err("data_key: name a seed or an account"),
+        };
         match self.wallets.store.data_key(&module, &seed, &w.scope, w.generation) {
             Ok((key, generation)) => {
                 let key = Zeroizing::new(hex::encode(&key[..]));
-                json!({ "ok": true, "key": key.as_str(), "generation": generation }).to_string()
+                json!({ "ok": true, "key": key.as_str(), "generation": generation, "seed": seed }).to_string()
             }
             Err(e) => manager_err(&e),
         }

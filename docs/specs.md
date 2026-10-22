@@ -122,7 +122,7 @@ refuse or stall a request, but it can't get a false signature past the checks ab
 | `unlocked` | — | `{ ok, unlocked: [{ account, expiresInMs, countLeft, apps, confirm }] }` |
 | `unattended_signatures` | — | `{ ok, signed: [{ handle, requester, account, ageMs }] }` |
 | `wallets` | — | `{ ok, wallets: [{ seed, name, locked, kinds, privateName? }] }` |
-| `data_key` | `params_json` | `{ ok, key, generation }`, or `{ ok: false, code: "locked" }` |
+| `data_key` | `params_json` | `{ ok, key, generation, seed }`, or `{ ok: false, code: "locked" }` |
 | `enroll_seed` | `params_json` | `{ ok, seed, new, unlocked }` |
 | `wallet_settings` | — | `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device, index, generation, ways, origin?, birthday? }], passwords: [{ id, name, wallets }] }`; `device`: its holders give an unlock key |
 | `unlock_wallet`, `set_rule`, `change_keys` | `params_json` | `{ ok, state: "done" }`, or `{ ok, state: "device", handle }`, or `{ ok: false, code, error }` |
@@ -231,7 +231,9 @@ restart or a `lock_wallets`.
 - **The seed key** is random, one per seed, with a generation. A module's key is
   `HKDF-SHA256(seed key, "logos/data/v1", module ‖ 0 ‖ scope ‖ 0 ‖ generation)`; `data_key({ seed,
   scope, generation? })` answers it to the caller, named by its identity, or `locked`. A holder
-  of the seed may name it its own way, as it lists it in `seed`. The current
+  of the seed may name it its own way, as it lists it in `seed`. A module that knows an account
+  and not its seed names the `account` instead, looked up among the accounts the signers last
+  listed (never asking one), and the answer names the `seed`. The current
   generation is the default; an earlier one still answers, so a module reads its old data and
   writes it again under the new key in its own time. `"profile"` instead of a seed is a key for
   data of no wallet, such as contacts: any unlocked wallet opens it.
