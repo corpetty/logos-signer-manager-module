@@ -18,7 +18,8 @@ crate-type = ["staticlib", "rlib"]
 alloy = { version = "1", default-features = false, features = ["std", "consensus", "eips", "rlp", "dyn-abi", "eip712"] }
 # Bitcoin: PSBTs, sighashes, keys below an account's xpub. The plugin's export list keeps libsecp256k1 in.
 bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64"] }
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "3b4542f4705a070bcc2d174cff6d9c8695248133" }
+# The ed25519 family: corpetty/logos-signer-interface feat/ed25519-family (03eece5 + one commit).
+logos-signer-interface = { git = "https://github.com/corpetty/logos-signer-interface", rev = "3ebac518b4a62bab534be01e669790bfc73a488e" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -31,7 +32,9 @@ zeroize = "1"
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
 
 [dev-dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "3b4542f4705a070bcc2d174cff6d9c8695248133", features = ["mock", "conformance"] }
+logos-signer-interface = { git = "https://github.com/corpetty/logos-signer-interface", rev = "3ebac518b4a62bab534be01e669790bfc73a488e", features = ["mock", "conformance"] }
+# A test signer for ed25519 identity keys.
+ed25519-dalek = "2"
 bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "std"] }
 alloy = { version = "1", default-features = false, features = ["std", "consensus", "eips", "signers", "signer-local"] }
 

@@ -258,7 +258,7 @@ impl AccountPublic {
         let family = match a.family {
             WireFamily::Bitcoin => Family::Segwit,
             WireFamily::BitcoinTaproot => Family::Taproot,
-            WireFamily::Evm => return Err(bad(format!("{} is not a Bitcoin account", a.id))),
+            WireFamily::Evm | WireFamily::Ed25519 => return Err(bad(format!("{} is not a Bitcoin account", a.id))),
         };
         let chain = match a.chain {
             Some(WireChain::Main) => Chain::Main,

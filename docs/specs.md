@@ -31,12 +31,14 @@ requester or an approver changes only the module it calls.
    when one was typed:
    - EIP-155 or EIP-1559 transaction hashes, EIP-191 and EIP-712 digests, or an opaque digest
      for EVM;
-   - BIP143 or BIP341 sighashes for each input of a PSBT.
+   - BIP143 or BIP341 sighashes for each input of a PSBT;
+   - SHA-256 of each record for an identity key.
 4. The signer answers with signatures only. The manager checks each one before building the
    result:
    - an EVM signature must recover to the account;
    - an ECDSA or BIP340 signature must verify against the key at that input's path, derived
-     from the account's xpub.
+     from the account's xpub;
+   - an Ed25519 signature must verify, strictly, against the identity key.
 
    It then builds the result itself: the signed transaction envelope, the 65-byte signature,
    or the PSBT with signatures added. A wrong password leaves the request on screen.
@@ -171,10 +173,41 @@ database.
 Unchanged from `keystore_module`: `{ address | group, purpose?, legs }`, with legs `tx`
 (`chain_id`, `tx`: the keystore's unsigned-transaction JSON), `message` (`text`), `digest`
 (`digest`, `purpose`), `typed_data` (`typed_data`) and `psbt` (`network`, `psbt`, base64). An EVM
-request names `address`; a Bitcoin request names `group` and carries exactly one `psbt` leg. The
+request names `address`; a Bitcoin request names `group` and carries exactly one `psbt` leg; an
+identity request names `identity` and carries `record` legs only (see below). The
 render, the commitment rules and the refusals (displayable text only, declared EIP-712 fields only,
 64 KiB, four pending per requester and sixteen in all, a sixty-second sweep for offers nobody
 claimed) are the keystore's. The commitment's domain tag is now `logos-signer-manager-approval-v1`.
+
+### An identity record
+
+An `ed25519` account is an identity key: a member's authorship key in a room, for instance, from
+the keystore's identity groups. Its roster key is `ed25519_` and its public key, so any signer
+holding that key may sign. A request names it by public key and carries one or more `record` legs:
+
+```json
+{ "identity": "<Ed25519 public key, hex>", "purpose": "post a message",
+  "legs": [ { "kind": "record", "record": "<dCBOR hex>" } ] }
+```
+
+A record is the dCBOR encoding of `[domain, {fields}]`, and what is signed is its SHA-256: the
+domain-separated records apps sign instead of bare digests (Muster builds its room events this
+way). The manager reads each one strictly before anything is shown, and refuses a record that is:
+- not `[text, {text: value}]`;
+- in any encoding but the deterministic one (shortest integers, definite lengths, map keys strictly
+  increasing in bytewise order of their encoding), or that does not re-encode to the same bytes;
+- carrying a float, a tag or any simple value but `true`, `false` and `null`.
+
+The render shows the identity key, its signer's name for it, the domain and every field in CBOR
+diagnostic notation with hidden characters escaped, and the digest. The commitment covers the key
+and every record's digest. The signer is handed `ed25519` hash items, one per record; each
+signature is checked against the identity key, strictly, before the result, the 64-byte signature
+per record, can be collected. A `record` leg for an address or a group, any other leg for an
+identity, and a device that shows requests are refused. Inside an unlock the person granted without
+confirmation, the keystore signs records as they arrive, as it does any other request.
+
+The `ed25519` family is on the signer interface's `feat/ed25519-family` branch
+(corpetty/logos-signer-interface `3ebac51`), proposed upstream with the keystore's identity groups.
 
 ### A PSBT
 

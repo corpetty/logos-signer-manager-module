@@ -12,6 +12,7 @@ pub mod error;
 pub mod evm;
 pub mod gate;
 pub mod psbt;
+pub mod record;
 pub mod registry;
 pub mod roster;
 pub mod origins;

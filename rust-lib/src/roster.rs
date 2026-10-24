@@ -21,6 +21,11 @@ pub fn key_of(a: &Account) -> Option<String> {
         let address = a.address.as_deref().unwrap_or(&a.id).trim();
         return (!address.is_empty()).then(|| address.to_ascii_lowercase());
     }
+    // An identity key is the same account wherever its public key is.
+    if a.family == Family::Ed25519 {
+        let key = a.address.as_deref()?.trim();
+        return (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())).then(|| identity_key(key));
+    }
     let xpub = Xpub::from_str(a.xpub.as_deref()?).ok()?;
     let mut h = Sha256::new();
     h.update(serde_json::to_string(&a.family).ok()?.as_bytes());
@@ -28,6 +33,11 @@ pub fn key_of(a: &Account) -> Option<String> {
     h.update(xpub.chain_code.as_bytes());
     h.update(xpub.public_key.serialize());
     Some(format!("btc_{}", hex::encode(&h.finalize()[..16])))
+}
+
+/// The roster key of an `ed25519` account: its public key, lowercase hex, tagged.
+pub fn identity_key(public_key: &str) -> String {
+    format!("ed25519_{}", public_key.trim().to_ascii_lowercase())
 }
 
 /// How a signer reaches its keys.
