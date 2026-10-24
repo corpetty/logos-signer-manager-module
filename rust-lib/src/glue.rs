@@ -300,6 +300,39 @@ impl KeyHolder for KeystoreKeys {
     }
 }
 
+/// What an identity key opens, from the keystore over IPC: its identity_open and identity_secret,
+/// which answer the manager alone.
+struct KeystoreIdentity;
+
+impl KeystoreIdentity {
+    fn call(&self, open: bool, account: &str, secret: Option<&str>, inputs: &[Vec<u8>]) -> crate::Result<Vec<String>> {
+        let hexes: Vec<String> = inputs.iter().map(hex::encode).collect();
+        let body = Zeroizing::new(if open {
+            json!({ "account": account, "sealed": hexes, "secret": secret }).to_string()
+        } else {
+            json!({ "account": account, "records": hexes, "secret": secret }).to_string()
+        });
+        let ks = modules().keystore_module;
+        let v = keystore_reply(if open { ks.identity_open(&body) } else { ks.identity_secret(&body) })?;
+        let field = if open { "opened" } else { "secrets" };
+        let out: Vec<String> = v
+            .get(field)
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        Ok(out)
+    }
+}
+
+impl crate::registry::IdentityKeys for KeystoreIdentity {
+    fn open(&mut self, account: &str, secret: Option<&str>, sealed: &[Vec<u8>]) -> crate::Result<Vec<String>> {
+        self.call(true, account, secret, sealed)
+    }
+    fn secret(&mut self, account: &str, secret: Option<&str>, records: &[Vec<u8>]) -> crate::Result<Vec<String>> {
+        self.call(false, account, secret, records)
+    }
+}
+
 /// A request signed without being shown, for the keys app and the signer to list.
 struct Unattended {
     handle: String,
@@ -427,6 +460,7 @@ impl Core {
                 });
             }
         }
+        r.set_identity_keys(Box::new(KeystoreIdentity));
         self.signers = r;
         self.started = true;
     }

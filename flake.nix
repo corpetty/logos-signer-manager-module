@@ -11,7 +11,7 @@
     # The first signer: the key files. A dependency, so it loads with the manager.
     # With identity keys (ed25519): corpetty/logos-evm-keystore-module feat/ed25519-identity.
     keystore_module = {
-      url = "github:corpetty/logos-evm-keystore-module/1c819f220c9dd280a5f153296c57368efb866cc3";
+      url = "github:corpetty/logos-evm-keystore-module/b3dc6bc2814f978ae353f4d3b3bc182470487576";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
     # The Keycard signers: optional, so they load with the manager only where installed.

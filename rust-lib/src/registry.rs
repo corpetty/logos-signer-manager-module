@@ -33,6 +33,18 @@ pub struct Found {
 #[derive(Default)]
 pub struct Registry {
     entries: Vec<Entry>,
+    /// What an identity key opens: the keystore's, outside `logos.signer/1`.
+    identity_keys: Option<Box<dyn IdentityKeys + Send>>,
+}
+
+/// What an identity key opens, from the keystore that holds it: the contents of sealed boxes
+/// addressed to it, and a secret for each record. Neither is a signature, so the signer interface
+/// does not carry them, and neither can be checked here as a signature is: the keystore is trusted
+/// with them as it is trusted with the key. `secret` is the account's password, or `None` inside
+/// its unlock. Answers are hex, one per input.
+pub trait IdentityKeys {
+    fn open(&mut self, account: &str, secret: Option<&str>, sealed: &[Vec<u8>]) -> crate::Result<Vec<String>>;
+    fn secret(&mut self, account: &str, secret: Option<&str>, records: &[Vec<u8>]) -> crate::Result<Vec<String>>;
 }
 
 fn same_id(a: &Account, id: &str) -> bool {
@@ -56,6 +68,15 @@ impl Registry {
     /// Signers are consulted in the order added: available signers take priority; a matching reader precedes a candidate Shell.
     pub fn add(&mut self, name: impl Into<String>, signer: Box<dyn Signer + Send>) {
         self.entries.push(Entry { name: name.into(), signer, info: None, accounts: None, missed: None });
+    }
+
+    /// Where what an identity key opens comes from: the keystore.
+    pub fn set_identity_keys(&mut self, keys: Box<dyn IdentityKeys + Send>) {
+        self.identity_keys = Some(keys);
+    }
+
+    pub fn identity_keys(&mut self) -> Option<&mut (dyn IdentityKeys + Send + 'static)> {
+        self.identity_keys.as_deref_mut()
     }
 
     pub fn names(&self) -> Vec<String> {

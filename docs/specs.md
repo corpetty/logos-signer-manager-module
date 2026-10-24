@@ -206,6 +206,20 @@ per record, can be collected. A `record` leg for an address or a group, any othe
 identity, and a device that shows requests are refused. Inside an unlock the person granted without
 confirmation, the keystore signs records as they arrive, as it does any other request.
 
+**What an identity opens.** A room member also needs what was sealed to it and a secret or two,
+which are not signatures, so they are the keystore's own (`identity_open`, `identity_secret`, Tier
+M) rather than `logos.signer/1`'s. An identity request may instead carry, all of one kind:
+- `{ kind: "open", sealed }`: a libsodium sealed box, hex, addressed to the key's X25519 form. The
+  render says how many and how long, and that what they hold goes to the requester unshown;
+- `{ kind: "secret", record }`: a record, read as above and shown field by field. The keystore
+  derives HMAC-SHA256 under the identity's seed over it, for the requester.
+
+The commitment covers each box's SHA-256, or each record's digest. Only the keystore takes them,
+with the password or inside its unlock as any request; `fetch_result` gives the opened contents
+or the secrets, hex, one per leg. The manager cannot check what the keystore opens as it checks a
+signature, and the render says so. These legs are a proposal: the signer interface's question of
+where decryption belongs.
+
 The `ed25519` family is on the signer interface's `feat/ed25519-family` branch
 (corpetty/logos-signer-interface `3ebac51`), proposed upstream with the keystore's identity groups.
 

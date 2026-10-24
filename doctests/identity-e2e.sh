@@ -10,7 +10,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
-KEYSTORE="${KEYSTORE:-github:corpetty/logos-evm-keystore-module/1c819f220c9dd280a5f153296c57368efb866cc3}"
+KEYSTORE="${KEYSTORE:-github:corpetty/logos-evm-keystore-module/b3dc6bc2814f978ae353f4d3b3bc182470487576}"
 ABOUT="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 # The reference derivation of m/7432'/0'/c0'…c7' for that phrase, purpose room-identity, context room:a.
 WANT_PK=c8b57cf9c3cc450e042a6ce6f09b0664859d9a1dd916d75e16d76973b10afbba
@@ -118,4 +118,36 @@ echo "$r" | grep -q '"state":"settled"' || fail "not signed as it arrived: $r"
 SIG=$(call manager_probe fetch "$(echo "$r" | field '["handle"]')" "$(echo "$r" | field '["receipt"]')" | field '["signed"][0]')
 verify "$PK" "$R4" "$SIG" || fail "unattended signature"
 
-echo "PASS: an identity key from the kept phrase signs a Muster record through the manager, shown or within an unlock"
+echo "── a box sealed to the room key opens, through the manager, inside the unlock"
+# libsodium seals to the X25519 form of the room key, as a room member seals an epoch grant.
+BOX=$(python3 - "$PK" <<'PY'
+import sys,ctypes,ctypes.util
+so=ctypes.CDLL(ctypes.util.find_library("sodium") or "libsodium.so.23"); assert so.sodium_init()>=0
+ed=(ctypes.c_ubyte*32)(*bytes.fromhex(sys.argv[1])); x=(ctypes.c_ubyte*32)()
+assert so.crypto_sign_ed25519_pk_to_curve25519(x,ed)==0
+m=b"epoch grant for room:a"; c=(ctypes.c_ubyte*(len(m)+48))()
+assert so.crypto_box_seal(c,(ctypes.c_ubyte*len(m))(*m),ctypes.c_ulonglong(len(m)),x)==0
+print(bytes(c).hex())
+PY
+)
+r=$(call manager_probe request "{\"identity\":\"$PK\",\"purpose\":\"read the room\",\"legs\":[{\"kind\":\"open\",\"sealed\":\"$BOX\"}]}")
+echo "$r" | grep -q '"state":"settled"' || fail "not opened as it arrived: $r"
+OPENED=$(call manager_probe fetch "$(echo "$r" | field '["handle"]')" "$(echo "$r" | field '["receipt"]')" | field '["signed"][0]')
+[ "$(echo "$OPENED" | xxd -r -p)" = "epoch grant for room:a" ] || fail "opened to $OPENED"
+echo "  opened: $(echo "$OPENED" | xxd -r -p)"
+
+echo "── the room's founding secret, shown and approved once the unlock is gone"
+call manager_probe lock "{\"account\":\"$KR\"}" >/dev/null
+INFO=82781b6d75737465722e726f6f6d2e666f756e64696e672d6b65792e7631a164726f6f6d66726f6f6d3a61   # ["muster.room.founding-key.v1", {room: "room:a"}]
+r=$(call manager_probe request "{\"identity\":\"$PK\",\"purpose\":\"re-open my room\",\"legs\":[{\"kind\":\"secret\",\"record\":\"$INFO\"}]}")
+echo "$r" | grep -q '"state":"offered"' || fail "a secret was derived unseen after the lock: $r"
+H=$(echo "$r" | field '["handle"]'); C=$(echo "$r" | field '["receipt"]')
+shown=$(call manager_probe acknowledge "$H")
+echo "$shown" | grep -qF "Domain: muster.room.founding-key.v1" || fail "the approver was not shown the secret's record"
+call manager_probe approve "$H" "$(echo "$shown" | field '["bundle_id"]')" pw | grep -q '"signed_count":1' || fail "approve the secret"
+SECRET=$(call manager_probe fetch "$H" "$C" | field '["signed"][0]')
+# The reference crate's HMAC under the same phrase's room key, computed independently.
+[ "$SECRET" = a8852b6526ea35ddbcc33fff338da70bbb01f94c8854acd7d69c8bf2cf453c54 ] || fail "the founding secret is $SECRET"
+echo "  founding secret matches the reference"
+
+echo "PASS: an identity key from the kept phrase signs, opens and derives through the manager, shown or within an unlock"

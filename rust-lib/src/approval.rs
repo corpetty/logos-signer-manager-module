@@ -56,6 +56,12 @@ pub enum Leg {
     /// A domain-separated record, dCBOR hex, for the intent's `identity`: every field is shown,
     /// and the digest, SHA-256 of the record, is computed here (see `record`).
     Record { record: String },
+    /// A libsodium sealed box, hex, addressed to the intent's `identity`: opened by the keystore,
+    /// its contents going to the requester unshown.
+    Open { sealed: String },
+    /// A record, dCBOR hex, read as `record` is: the keystore derives a secret for it, HMAC-SHA256
+    /// keyed by the identity's seed, for the requester.
+    Secret { record: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +304,58 @@ fn parse_identity(s: &str) -> Result<String> {
         return Err(bad("intent: identity is an Ed25519 public key, 32 bytes hex"));
     }
     Ok(k)
+}
+
+/// What an identity request asks of the key. One kind per request.
+enum IdOp {
+    /// Sign each record.
+    Sign(Vec<SignedRecord>),
+    /// Open each sealed box.
+    Open(Vec<Vec<u8>>),
+    /// Derive a secret for each record.
+    Secret(Vec<SignedRecord>),
+}
+
+impl IdOp {
+    fn len(&self) -> usize {
+        match self {
+            IdOp::Sign(r) | IdOp::Secret(r) => r.len(),
+            IdOp::Open(b) => b.len(),
+        }
+    }
+}
+
+/// An identity request's legs, all of one kind: records to sign, boxes to open, or records to
+/// derive secrets for.
+fn id_op(legs: &[Leg]) -> Result<IdOp> {
+    let mixed = || bad("intent: an identity request's legs are all record, all open, or all secret");
+    match legs.first() {
+        Some(Leg::Record { .. }) => legs
+            .iter()
+            .map(|l| if let Leg::Record { record } = l { parse_record(record) } else { Err(mixed()) })
+            .collect::<Result<_>>()
+            .map(IdOp::Sign),
+        Some(Leg::Secret { .. }) => legs
+            .iter()
+            .map(|l| if let Leg::Secret { record } = l { parse_record(record) } else { Err(mixed()) })
+            .collect::<Result<_>>()
+            .map(IdOp::Secret),
+        Some(Leg::Open { .. }) => legs
+            .iter()
+            .map(|l| match l {
+                Leg::Open { sealed } => {
+                    let b = hex::decode(sealed.trim().trim_start_matches("0x")).map_err(|_| bad("open: not hex"))?;
+                    if b.len() < 48 {
+                        return Err(bad("open: shorter than a sealed box"));
+                    }
+                    Ok(b)
+                }
+                _ => Err(mixed()),
+            })
+            .collect::<Result<_>>()
+            .map(IdOp::Open),
+        _ => Err(bad("intent: an identity request carries record, open or secret legs")),
+    }
 }
 
 fn parse_record(hex_record: &str) -> Result<SignedRecord> {
@@ -620,6 +678,34 @@ impl Approvals {
             r.last_error = Some(e.message.clone());
             return Err(e.into());
         }
+        if let Prepared::Identity { op: op @ (IdOp::Open(_) | IdOp::Secret(_)), .. } = &prepared {
+            if found.name != KEYSTORE {
+                return Err(bad("only the keystore opens what is sealed to an identity"));
+            }
+            let pw = (!secret.is_empty()).then_some(secret);
+            let keys = signers.identity_keys().ok_or_else(|| bad("no keystore to open it"))?;
+            let out = match op {
+                IdOp::Open(boxes) => keys.open(&found.account.id, pw, boxes),
+                IdOp::Secret(records) => {
+                    let raw: Vec<Vec<u8>> = records.iter().map(|x| x.bytes().to_vec()).collect();
+                    keys.secret(&found.account.id, pw, &raw)
+                }
+                IdOp::Sign(_) => unreachable!("matched above"),
+            };
+            let out = match out {
+                Ok(v) if v.len() == op.len() => v,
+                Ok(_) => return Err(ManagerError::Signing("the keystore answered a different number of items".into())),
+                Err(e) => {
+                    r.last_error = Some(e.to_string());
+                    return Err(e);
+                }
+            };
+            let n = out.len();
+            r.results = Some(out);
+            r.state = State::Settled(Outcome::Approved);
+            r.last_error = None;
+            return Ok(Approved::Settled(n));
+        }
         let request = SignRequest {
             account: found.account.id.clone(),
             payload: payload_for(&r.intent, &prepared, &found.info)?,
@@ -768,8 +854,8 @@ fn cancel_job(signers: &mut Registry, r: &mut Record) {
 
 enum Prepared {
     Evm { found: Found },
-    /// An identity request: its records, read here.
-    Identity { found: Found, records: Vec<SignedRecord> },
+    /// An identity request: what it asks of the key, read here.
+    Identity { found: Found, op: IdOp },
     /// A Bitcoin request: the manager's reading of its PSBT.
     Psbt { found: Found, acct: AccountPublic, psbt: Box<Psbt>, checked: Checked, name: String },
 }
@@ -791,23 +877,16 @@ fn evm_only() -> ManagerError {
 fn prepare_on(signers: &mut Registry, intent: &Intent, pinned: Option<Found>) -> Result<Prepared> {
     let target = target_of(intent)?;
     if target == Target::Identity {
-        let records = intent
-            .legs
-            .iter()
-            .map(|l| match l {
-                Leg::Record { record } => parse_record(record),
-                _ => Err(bad("intent: an identity request carries record legs only")),
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let op = id_op(&intent.legs)?;
         let key = roster::identity_key(&parse_identity(&intent.identity)?);
         let found = match pinned { Some(f) => f, None => signers.find(&key)? };
         if found.account.family != logos_signer_interface::Family::Ed25519 {
             return Err(bad(format!("{} is not an identity key", intent.identity.trim())));
         }
-        return Ok(Prepared::Identity { found, records });
+        return Ok(Prepared::Identity { found, op });
     }
-    if intent.legs.iter().any(|l| matches!(l, Leg::Record { .. })) {
-        return Err(bad("intent: a record leg needs an identity, not an address or a group"));
+    if intent.legs.iter().any(|l| matches!(l, Leg::Record { .. } | Leg::Open { .. } | Leg::Secret { .. })) {
+        return Err(bad("intent: record, open and secret legs need an identity, not an address or a group"));
     }
     let bitcoin = target == Target::Bitcoin;
     if !bitcoin {
@@ -844,7 +923,8 @@ fn items_for(intent: &Intent, prepared: &Prepared) -> Result<Vec<HashItem>> {
     if let Prepared::Psbt { acct, psbt, checked, .. } = prepared {
         return btcpsbt::hash_items(acct, psbt, checked);
     }
-    if let Prepared::Identity { records, .. } = prepared {
+    if let Prepared::Identity { op, .. } = prepared {
+        let IdOp::Sign(records) = op else { return Err(bad("intent: nothing here is signed")) };
         return Ok(records
             .iter()
             .map(|r| HashItem { path: None, scheme: Scheme::Ed25519, digest: hex::encode(r.digest()) })
@@ -860,7 +940,9 @@ fn items_for(intent: &Intent, prepared: &Prepared) -> Result<Vec<HashItem>> {
                 Leg::Digest { digest, .. } => evm::parse_b256(digest)?,
                 Leg::TypedData { typed_data } => evm::typed_data_signing_hash(typed_data)?,
                 Leg::Psbt { .. } => return Err(evm_only()),
-                Leg::Record { .. } => return Err(bad("intent: a record leg needs an identity")),
+                Leg::Record { .. } | Leg::Open { .. } | Leg::Secret { .. } => {
+                    return Err(bad("intent: record, open and secret legs need an identity"))
+                }
             };
             Ok(HashItem { path: None, scheme: Scheme::Evm, digest: hex::encode(digest) })
         })
@@ -870,10 +952,15 @@ fn items_for(intent: &Intent, prepared: &Prepared) -> Result<Vec<HashItem>> {
 /// The kind of request the signer is handed: hashes when it takes them, else the request itself,
 /// one transaction, message or PSBT, for a device to show. Refused when the signer can't take it.
 fn kind_for(intent: &Intent, prepared: &Prepared, info: &SignerInfo) -> Result<RequestKind> {
+    let refused = |why: String| ManagerError::Refused(format!("{} {why}", prepared.found().name));
+    if let Prepared::Identity { op, found } = prepared {
+        if !matches!(op, IdOp::Sign(_)) && found.name != KEYSTORE {
+            return Err(refused("is not the keystore, which alone opens what is sealed to an identity".into()));
+        }
+    }
     if info.request_kinds.contains(&RequestKind::Hash) {
         return Ok(RequestKind::Hash);
     }
-    let refused = |why: String| ManagerError::Refused(format!("{} {why}", prepared.found().name));
     if let Prepared::Identity { .. } = prepared {
         return Err(refused("signs what it shows, and no device shows records yet".into()));
     }
@@ -924,7 +1011,7 @@ fn kind_words(kind: RequestKind) -> &'static str {
 fn results(intent: &Intent, prepared: Prepared, sigs: &[Signature]) -> Result<Vec<String>> {
     let items = items_for(intent, &prepared)?;
     match prepared {
-        Prepared::Identity { found, .. } => {
+        Prepared::Identity { found, op: _ } => {
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
                 let mut mine = sigs.iter().filter(|s| s.item == i);
@@ -978,14 +1065,26 @@ fn commitment(intent: &Intent, prepared: &Prepared) -> Result<[u8; 32]> {
         h.update(&checked.canonical);
         return Ok(h.finalize().into());
     }
-    if let Prepared::Identity { records, .. } = prepared {
+    if let Prepared::Identity { op, .. } = prepared {
         h.update(b"identity\n");
         h.update(parse_identity(&intent.identity)?.as_bytes());
         h.update(b"\n");
-        for r in records {
-            h.update(b"record\n");
-            h.update(r.digest());
-            h.update(b"\n");
+        match op {
+            IdOp::Sign(records) | IdOp::Secret(records) => {
+                let tag: &[u8] = if matches!(op, IdOp::Sign(_)) { b"record\n" } else { b"secret\n" };
+                for r in records {
+                    h.update(tag);
+                    h.update(r.digest());
+                    h.update(b"\n");
+                }
+            }
+            IdOp::Open(boxes) => {
+                for b in boxes {
+                    h.update(b"open\n");
+                    h.update(Sha256::digest(b));
+                    h.update(b"\n");
+                }
+            }
         }
         return Ok(h.finalize().into());
     }
@@ -1028,7 +1127,9 @@ fn commitment(intent: &Intent, prepared: &Prepared) -> Result<[u8; 32]> {
                 h.update(evm::typed_data_signing_hash(typed_data)?.as_slice());
             }
             Leg::Psbt { .. } => return Err(evm_only()),
-            Leg::Record { .. } => return Err(bad("intent: a record leg needs an identity")),
+            Leg::Record { .. } | Leg::Open { .. } | Leg::Secret { .. } => {
+                return Err(bad("intent: record, open and secret legs need an identity"))
+            }
         }
         h.update(b"\n");
     }
@@ -1051,7 +1152,7 @@ fn render(intent: &Intent, prepared: &Prepared, bundle_id: &[u8; 32]) -> Result<
         }
         return Ok((claim, out));
     }
-    if let Prepared::Identity { found, records } = prepared {
+    if let Prepared::Identity { found, op } = prepared {
         out.push(format!("Identity key: {}", parse_identity(&intent.identity)?));
         if let Some(label) = found.account.label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
             if check_displayable(label, "label").is_ok() {
@@ -1059,11 +1160,32 @@ fn render(intent: &Intent, prepared: &Prepared, bundle_id: &[u8; 32]) -> Result<
             }
         }
         out.push(format!("Commitment: {}", hex::encode(bundle_id)));
-        out.push(format!("{} item(s) to sign:", records.len()));
-        for (i, r) in records.iter().enumerate() {
-            out.push(format!("  [{}] Sign a record", i + 1));
-            out.extend(r.render().into_iter().map(|l| format!("      {l}")));
-            out.push(format!("      Digest: SHA-256 of the record, 0x{}", hex::encode(r.digest())));
+        match op {
+            IdOp::Sign(records) => {
+                out.push(format!("{} item(s) to sign:", records.len()));
+                for (i, r) in records.iter().enumerate() {
+                    out.push(format!("  [{}] Sign a record", i + 1));
+                    out.extend(r.render().into_iter().map(|l| format!("      {l}")));
+                    out.push(format!("      Digest: SHA-256 of the record, 0x{}", hex::encode(r.digest())));
+                }
+            }
+            IdOp::Open(boxes) => {
+                out.push(format!("{} sealed message(s) addressed to this key, to open:", boxes.len()));
+                for (i, b) in boxes.iter().enumerate() {
+                    out.push(format!("  [{}] Open {} bytes sealed to this key's X25519 form", i + 1, b.len()));
+                }
+                out.push("What they hold goes to the requester and is not shown here. The manager".into());
+                out.push("cannot check what the keystore opens, as it checks a signature.".into());
+            }
+            IdOp::Secret(records) => {
+                out.push(format!("{} secret(s) to derive, one per record:", records.len()));
+                for (i, r) in records.iter().enumerate() {
+                    out.push(format!("  [{}] A secret for this record", i + 1));
+                    out.extend(r.render().into_iter().map(|l| format!("      {l}")));
+                }
+                out.push("Each secret is HMAC-SHA256 under this key, for the requester. The same".into());
+                out.push("record gives the same secret on every device restored from the phrase.".into());
+            }
         }
         return Ok((claim, out));
     }
@@ -1113,7 +1235,9 @@ fn render(intent: &Intent, prepared: &Prepared, bundle_id: &[u8; 32]) -> Result<
                 out.push(format!("      Signing hash: 0x{}", hex::encode(evm::typed_data_signing_hash(typed_data)?)));
             }
             Leg::Psbt { .. } => return Err(evm_only()),
-            Leg::Record { .. } => return Err(bad("intent: a record leg needs an identity")),
+            Leg::Record { .. } | Leg::Open { .. } | Leg::Secret { .. } => {
+                return Err(bad("intent: record, open and secret legs need an identity"))
+            }
         }
     }
     Ok((claim, out))
@@ -2248,9 +2372,122 @@ mod identity_tests {
 
     fn identity_fixture(signer: IdentitySigner) -> (Registry, Approvals, String) {
         let pk = signer.public();
+        let unlocked = signer.unlocked;
         let mut r = Registry::new();
         r.add("keystore_module", Box::new(signer));
+        r.set_identity_keys(Box::new(TestKeys { unlocked, seen: Default::default() }));
         (r, Approvals::new(), pk)
+    }
+
+    /// A stand-in for the keystore's identity_open and identity_secret: the cryptography is held to
+    /// libsodium in the keystore; what is tested here is what reaches it and what comes back.
+    struct TestKeys {
+        unlocked: bool,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>, usize)>>>,
+    }
+
+    impl crate::registry::IdentityKeys for TestKeys {
+        fn open(&mut self, account: &str, secret: Option<&str>, sealed: &[Vec<u8>]) -> Result<Vec<String>> {
+            self.check(account, secret, sealed.len())?;
+            Ok(sealed.iter().map(|b| hex::encode(&b[48..])).collect())
+        }
+        fn secret(&mut self, account: &str, secret: Option<&str>, records: &[Vec<u8>]) -> Result<Vec<String>> {
+            self.check(account, secret, records.len())?;
+            Ok(records.iter().map(|r| hex::encode(Sha256::digest(r))).collect())
+        }
+    }
+
+    impl TestKeys {
+        fn check(&mut self, account: &str, secret: Option<&str>, n: usize) -> Result<()> {
+            self.seen.lock().unwrap().push((account.into(), secret.map(str::to_string), n));
+            match secret {
+                Some("pw") => Ok(()),
+                Some(_) => Err(logos_signer_interface::SignerError::new(ErrorCode::WrongSecret, "wrong password").into()),
+                None if self.unlocked => Ok(()),
+                None => Err(logos_signer_interface::SignerError::new(ErrorCode::Locked, "locked").into()),
+            }
+        }
+    }
+
+    /// A stand-in sealed box: 48 bytes of header, then what the test keystore "opens".
+    fn sealed(plain: &[u8]) -> String {
+        hex::encode([vec![0xeeu8; 48], plain.to_vec()].concat())
+    }
+
+    fn open_intent(pk: &str, boxes: &[String]) -> String {
+        let legs: Vec<String> = boxes.iter().map(|b| format!(r#"{{"kind":"open","sealed":"{b}"}}"#)).collect();
+        format!(r#"{{"identity":"{pk}","purpose":"read the room","legs":[{}]}}"#, legs.join(","))
+    }
+
+    #[test]
+    fn sealed_boxes_open_only_through_an_approval_and_go_to_the_requester() {
+        let (mut s, mut ap, pk) = identity_fixture(IdentitySigner::new());
+        let (h, receipt) = ap.request(&mut s, "muster_module", &open_intent(&pk, &[sealed(b"grant 1"), sealed(b"grant 2")])).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        let lines = v.render_lines.join("\n");
+        for want in ["2 sealed message(s) addressed to this key, to open:", "[1] Open 55 bytes", "not shown here", "cannot check what the keystore opens"] {
+            assert!(lines.contains(want), "missing {want:?} in\n{lines}");
+        }
+        assert!(!lines.contains("grant"), "the render shows nothing of what is sealed");
+        let e = ap.approve(&mut s, &h, &v.bundle_id, "wrong", false).unwrap_err();
+        assert_eq!(e.code(), Some(ErrorCode::WrongSecret));
+        assert_eq!(ap.status(&mut s, &h, &receipt).unwrap().0, "rendered", "a wrong password leaves it on screen");
+        assert_eq!(approve(&mut ap, &mut s, &h, &v.bundle_id, "pw").unwrap(), 2);
+        let got = ap.fetch_result(&mut s, &h, &receipt).unwrap();
+        assert_eq!(got, vec![hex::encode(b"grant 1"), hex::encode(b"grant 2")]);
+        assert!(ap.fetch_result(&mut s, &h, "not-the-receipt").is_err());
+    }
+
+    #[test]
+    fn a_secret_is_derived_for_a_record_the_person_was_shown() {
+        let (mut s, mut ap, pk) = identity_fixture(IdentitySigner::new());
+        let info = SignedRecord::build("muster.room.founding-key.v1", vec![("room", rtext("room:a"))]);
+        let intent = format!(r#"{{"identity":"{pk}","legs":[{{"kind":"secret","record":"{}"}}]}}"#, hex::encode(info.bytes()));
+        let (h, receipt) = ap.request(&mut s, "muster_module", &intent).unwrap();
+        let v = ap.acknowledge(&mut s, &h).unwrap();
+        let lines = v.render_lines.join("\n");
+        assert!(lines.contains("Domain: muster.room.founding-key.v1") && lines.contains("room: \"room:a\""), "{lines}");
+        assert_eq!(approve(&mut ap, &mut s, &h, &v.bundle_id, "pw").unwrap(), 1);
+        assert_eq!(ap.fetch_result(&mut s, &h, &receipt).unwrap(), vec![hex::encode(Sha256::digest(info.bytes()))]);
+    }
+
+    #[test]
+    fn opening_and_deriving_happen_without_asking_only_inside_the_keystores_unlock() {
+        let mut signer = IdentitySigner::new();
+        signer.unlocked = true;
+        let (mut s, mut ap, pk) = identity_fixture(signer);
+        let (h, receipt) = ap.request(&mut s, "muster_module", &open_intent(&pk, &[sealed(b"grant")])).unwrap();
+        assert_eq!(ap.sign_unattended(&mut s, &h).unwrap(), Approved::Settled(1));
+        assert_eq!(ap.fetch_result(&mut s, &h, &receipt).unwrap(), vec![hex::encode(b"grant")]);
+        // Locked, nothing is opened unseen.
+        let (mut s, mut ap, pk) = identity_fixture(IdentitySigner::new());
+        let (h, _) = ap.request(&mut s, "muster_module", &open_intent(&pk, &[sealed(b"grant")])).unwrap();
+        assert!(ap.sign_unattended(&mut s, &h).is_err());
+    }
+
+    #[test]
+    fn identity_requests_of_mixed_or_malformed_legs_are_refused() {
+        let (mut s, mut ap, pk) = identity_fixture(IdentitySigner::new());
+        let rec = hex::encode(author_record(1).bytes());
+        for (what, intent) in [
+            ("mixed record and open", format!(r#"{{"identity":"{pk}","legs":[{{"kind":"record","record":"{rec}"}},{{"kind":"open","sealed":"{}"}}]}}"#, sealed(b"x"))),
+            ("a box shorter than a sealed box", open_intent(&pk, &["00".repeat(20)])),
+            ("an open for an address", format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"open","sealed":"{}"}}]}}"#, sealed(b"x"))),
+            ("a secret over a non-record", format!(r#"{{"identity":"{pk}","legs":[{{"kind":"secret","record":"{}"}}]}}"#, "ab".repeat(32))),
+        ] {
+            assert!(ap.request(&mut s, "muster_module", &intent).is_err(), "accepted {what}");
+        }
+    }
+
+    #[test]
+    fn only_the_keystore_opens_what_is_sealed_to_an_identity() {
+        let signer = IdentitySigner::new();
+        let pk = signer.public();
+        let mut s = Registry::new();
+        s.add("some_device_module", Box::new(signer));
+        s.set_identity_keys(Box::new(TestKeys { unlocked: false, seen: Default::default() }));
+        let mut ap = Approvals::new();
+        assert!(ap.request(&mut s, "muster_module", &open_intent(&pk, &[sealed(b"x")])).is_err());
     }
 
     /// Muster's authorship record, as `module/src/coordination/authorship.nim` builds one.

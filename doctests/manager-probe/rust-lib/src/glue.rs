@@ -16,6 +16,8 @@ pub trait ManagerProbeModule: Send + 'static {
     fn derive_identity(&mut self, params_json: String) -> String;
     /// Unlock an account on terms, as the manager's custodian: `unlock`'s params.
     fn unlock(&mut self, params_json: String) -> String;
+    /// Lock an account, or every one, as the manager's custodian: `lock`'s params.
+    fn lock(&mut self, params_json: String) -> String;
     /// Every account with every signer holding it, as a named module reads it.
     fn roster(&mut self) -> String;
     /// The approver chose which holder signs a request on screen.
@@ -85,6 +87,10 @@ impl ManagerProbeModule for ManagerProbeModuleImpl {
 
     fn unlock(&mut self, params_json: String) -> String {
         pass(modules().signer_manager_module.unlock(&params_json))
+    }
+
+    fn lock(&mut self, params_json: String) -> String {
+        pass(modules().signer_manager_module.lock(&params_json))
     }
 
     fn roster(&mut self) -> String {
