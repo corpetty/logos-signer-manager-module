@@ -10,6 +10,12 @@ pub trait ManagerProbeModule: Send + 'static {
     fn import_bitcoin(&mut self, params_json: String) -> String;
     /// Derive an EVM account from a phrase into the keystore, as its custodian: `import_mnemonic`'s params.
     fn import_phrase(&mut self, params_json: String) -> String;
+    /// Make an identity group in the keystore, as its custodian: `import_identity`'s params.
+    fn import_identity(&mut self, params_json: String) -> String;
+    /// An identity key for a purpose and a context, as the keystore's custodian: `derive_identity`'s params.
+    fn derive_identity(&mut self, params_json: String) -> String;
+    /// Unlock an account on terms, as the manager's custodian: `unlock`'s params.
+    fn unlock(&mut self, params_json: String) -> String;
     /// Every account with every signer holding it, as a named module reads it.
     fn roster(&mut self) -> String;
     /// The approver chose which holder signs a request on screen.
@@ -67,6 +73,18 @@ impl ManagerProbeModule for ManagerProbeModuleImpl {
 
     fn import_phrase(&mut self, params_json: String) -> String {
         pass(modules().keystore_module.import_mnemonic(&params_json))
+    }
+
+    fn import_identity(&mut self, params_json: String) -> String {
+        pass(modules().keystore_module.import_identity(&params_json))
+    }
+
+    fn derive_identity(&mut self, params_json: String) -> String {
+        pass(modules().keystore_module.derive_identity(&params_json))
+    }
+
+    fn unlock(&mut self, params_json: String) -> String {
+        pass(modules().signer_manager_module.unlock(&params_json))
     }
 
     fn roster(&mut self) -> String {
