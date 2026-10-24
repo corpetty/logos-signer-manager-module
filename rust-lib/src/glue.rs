@@ -618,6 +618,20 @@ impl Core {
         self.bind_signers();
         // The terms of any unlock were kept here and are gone: nothing stays unlocked past a restart.
         let _ = KeystoreKeys.lock(None);
+        // An always-unlocked wallet is open from the start, but a module loaded before this one
+        // hears of it only once its subscription arms: say so again then.
+        let me = self.me.clone();
+        std::thread::spawn(move || {
+            for wait in [3, 15] {
+                std::thread::sleep(Duration::from_secs(wait));
+                let Some(core) = me.upgrade() else { return };
+                let mut core = core.lock().unwrap_or_else(|e| e.into_inner());
+                for w in core.wallets.store.wallets().into_iter().filter(|w| !w.locked) {
+                    core.wallets.note(&w.seed);
+                }
+                core.refresh();
+            }
+        });
     }
 
     fn configure(&mut self, config_json: String) -> String {
