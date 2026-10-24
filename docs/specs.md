@@ -243,6 +243,11 @@ restart or a `lock_wallets`.
   seed, the way and the generation. "Device only" is the default; a QR wallet that gives no unlock
   key takes a password alone. Forgetting the password of a "device and password" way loses the
   wallet's data: the person adds the wallet again.
+- **Always unlocked.** A rule of one way that takes nothing, `[[]]`, leaves the wallet open from
+  the moment the module starts, and Lock leaves it open: its seed key is wrapped under a key anyone
+  with the files can derive, so its data is as readable as if it were stored in the clear. Modules
+  keep using `data_key` unchanged. Moving it back to a protected rule gives it new keys, since the
+  old one sat where anyone could read it; data under the old generation still opens through the chain.
 - **Passwords** are named and shared: one can unlock several wallets. Each has a key of its own
   under its scrypt output (N = 2^17, r = 8, p = 1), so `change_password` touches no wallet, and
   `remove_password` is refused while a rule takes it. Their names show in the clear.

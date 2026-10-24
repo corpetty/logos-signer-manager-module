@@ -129,7 +129,8 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// unlocked }`. `seed` in is the signer's own name for it. The configured signers only.
     fn enroll_seed(&self, params_json: String) -> String;
     /// The Signer app's view: `{ ok, wallets: [{ seed, name, privateName?, locked, holders, device,
-    /// index, generation, ways: [{ id, factors: [{ kind, id?, name? }] }], origin?, birthday? }],
+    /// index, generation, ways: [{ id, factors: [{ kind, id?, name? }] }], alwaysUnlocked, origin?,
+    /// birthday? }],
     /// passwords: [{ id, name, wallets }] }`. `device`: its holders give an unlock key, so a way
     /// may take the device. Approvers.
     fn wallet_settings(&self) -> String;
@@ -145,7 +146,8 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// `{ seeds? }`, every wallet for `{}` → `{ ok, locked }`. Approvers.
     fn lock_wallets(&self, params_json: String) -> String;
     /// A wallet's ways in: `{ seed, ways: [[factor]], holder?, secret?, passwords? }`, each factor
-    /// `device` or `password:<id>` → as `unlock_wallet`. Approvers.
+    /// `device` or `password:<id>` → as `unlock_wallet`; `[[]]` alone leaves it always unlocked.
+    /// Approvers.
     fn set_rule(&self, params_json: String) -> String;
     /// New keys for a wallet: `{ seed, newIndex?, holder?, secret?, passwords? }`; `newIndex: true`
     /// moves to the next unlock key → as `unlock_wallet`. Approvers.
@@ -1240,9 +1242,10 @@ impl Core {
                     .iter()
                     .map(|(id, factors)| json!({ "id": id, "factors": factors.iter().map(factor).collect::<Vec<_>>() }))
                     .collect();
+                let always = w.ways.iter().any(|(_, f)| f.is_empty());
                 json!({ "seed": w.seed, "name": w.name, "privateName": w.about.private_name, "locked": w.locked,
                         "holders": w.holders, "device": w.device, "index": w.index, "generation": w.generation,
-                        "ways": ways, "origin": w.about.origin, "birthday": w.about.birthday })
+                        "ways": ways, "alwaysUnlocked": always, "origin": w.about.origin, "birthday": w.about.birthday })
             })
             .collect();
         let passwords: Vec<_> = store

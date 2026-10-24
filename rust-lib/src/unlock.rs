@@ -350,6 +350,7 @@ impl Unlock {
             (Ok(s), Ok(p)) if s.version <= VERSION && p.version <= VERSION => {
                 u.seeds = s.seeds;
                 u.passwords = p.passwords;
+                u.open_always();
             }
             (Ok(_), Ok(_)) => u.broken = Some("the unlock files are from a newer version".into()),
             (Err(e), _) | (_, Err(e)) => u.broken = Some(e),
@@ -587,6 +588,19 @@ impl Unlock {
         self.share_profile()
     }
 
+    /// Open every always-unlocked seed that isn't open: its way in takes nothing.
+    fn open_always(&mut self) {
+        let free: Vec<(String, String)> = self
+            .seeds
+            .iter()
+            .filter(|s| !self.open.contains_key(&s.id))
+            .filter_map(|s| s.ways.iter().find(|w| w.factors.is_empty()).map(|w| (s.id.clone(), w.id.clone())))
+            .collect();
+        for (seed, way) in free {
+            let _ = self.unlock(&seed, &way, &Secrets::default());
+        }
+    }
+
     /// The profile key from the first unlocked seed that has it, wrapped into every unlocked seed
     /// that doesn't yet.
     fn share_profile(&mut self) -> Result<()> {
@@ -610,12 +624,14 @@ impl Unlock {
         Ok(())
     }
 
-    /// Forget these seeds' keys, or every one's; the profile key goes with the last.
+    /// Forget these seeds' keys, or every one's; the profile key goes with the last. An
+    /// always-unlocked seed stays open.
     pub fn lock(&mut self, seeds: Option<&[String]>) -> usize {
         let before = self.open.len();
+        let always: Vec<String> = self.seeds.iter().filter(|s| always_unlocked(s)).map(|s| s.id.clone()).collect();
         match seeds {
-            Some(list) => self.open.retain(|id, _| !list.iter().any(|s| s.trim() == id)),
-            None => self.open.clear(),
+            Some(list) => self.open.retain(|id, _| always.contains(id) || !list.iter().any(|s| s.trim() == id)),
+            None => self.open.retain(|id, _| always.contains(id)),
         }
         if self.open.is_empty() {
             self.profile = None;
@@ -729,6 +745,15 @@ impl Unlock {
             }
         }
         self.record_mut(seed)?.ways = next;
+        // Its key sat where anyone could read it: a protected rule starts from a new one.
+        if always_unlocked(&rec) && !always_unlocked(self.record(seed)?) {
+            if let Err(e) = self.change_keys(seed, None, secrets) {
+                *self.record_mut(seed)? = rec;
+                self.open.insert(seed.trim().to_string(), key);
+                return Err(e);
+            }
+            return Ok(());
+        }
         self.save()
     }
 
@@ -856,20 +881,29 @@ fn normalise(ways: &[Vec<Factor>]) -> Result<Vec<Vec<Factor>>> {
     if ways.is_empty() || ways.len() > MAX_WAYS {
         return Err(bad(format!("a wallet has 1 to {MAX_WAYS} ways in")));
     }
+    // A way that takes nothing leaves the wallet always unlocked: any other way would mean nothing.
+    if ways.iter().any(|w| w.is_empty()) {
+        if ways.len() > 1 {
+            return Err(bad("an always-unlocked wallet has no other way in"));
+        }
+        return Ok(vec![Vec::new()]);
+    }
     let mut out: Vec<Vec<Factor>> = Vec::new();
     for w in ways {
         let mut w = w.clone();
         w.sort();
         w.dedup();
-        if w.is_empty() {
-            return Err(bad("a way in takes at least one factor"));
-        }
         if out.contains(&w) {
             return Err(bad("the same way in twice"));
         }
         out.push(w);
     }
     Ok(out)
+}
+
+/// A way in that takes nothing: the seed key is kept where anyone with the files can open it.
+fn always_unlocked(rec: &SeedRecord) -> bool {
+    rec.ways.iter().any(|w| w.factors.is_empty())
 }
 
 fn check_label(s: &str, what: &str) -> Result<()> {
@@ -1246,11 +1280,48 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_is_one_to_eight_ways_each_taking_something() {
+    fn an_always_unlocked_wallet_opens_at_start_and_lock_leaves_it_open() {
+        let dir = Dir::new();
+        let mut s = dir.store();
+        let free = s.enroll(holder("keycard_module", "a"), Some(&u(1)), "Free", About::default()).unwrap().seed;
+        let kept = s.enroll(holder("keycard_module", "b"), Some(&u(2)), "Kept", About::default()).unwrap().seed;
+        s.set_rule(&free, &[vec![]], &Secrets::default()).unwrap();
+        let (k, g) = s.data_key("core", &free, "wallet", None).unwrap();
+        assert_eq!(g, 0, "taking the protection off keeps the key");
+        assert_eq!(s.lock(None), 1, "only the protected one locks");
+        assert!(s.is_unlocked(&free) && !s.is_unlocked(&kept));
+        assert_eq!(s.lock(Some(&[free.clone()])), 0);
+        assert!(s.data_key("core", PROFILE, "contacts", None).is_ok(), "the profile stays open with it");
+
+        let again = dir.store();
+        assert!(again.is_unlocked(&free) && !again.is_unlocked(&kept), "open from the start");
+        assert_eq!(again.data_key("core", &free, "wallet", None).unwrap(), (k, 0));
+    }
+
+    #[test]
+    fn protecting_an_always_unlocked_wallet_moves_it_to_new_keys() {
+        let mut s = Unlock::in_memory().with_cost(CHEAP);
+        let seed = s.enroll(holder("keycard_module", "uid"), Some(&u(1)), "Card", About::default()).unwrap().seed;
+        s.set_rule(&seed, &[vec![]], &Secrets::default()).unwrap();
+        let (old, _) = s.data_key("core", &seed, "wallet", None).unwrap();
+        let before = s.record(&seed).unwrap().clone();
+        assert!(s.set_rule(&seed, &[vec![Factor::Device]], &Secrets::default()).is_err(), "needs the device");
+        assert_eq!(s.record(&seed).unwrap().ways.len(), before.ways.len(), "a refusal changes nothing");
+        assert!(s.record(&seed).unwrap().ways[0].factors.is_empty());
+        s.set_rule(&seed, &[vec![Factor::Device]], &device(1)).unwrap();
+        let (new, g) = s.data_key("core", &seed, "wallet", None).unwrap();
+        assert_eq!(g, 1, "a new key: the old one sat in the clear");
+        assert_ne!(new, old);
+        assert_eq!(s.data_key("core", &seed, "wallet", Some(0)).unwrap().0, old, "old data still opens");
+        assert_eq!(s.lock(None), 1, "and it locks again");
+    }
+
+    #[test]
+    fn a_rule_is_one_to_eight_ways_and_one_taking_nothing_stands_alone() {
         let mut s = Unlock::in_memory().with_cost(CHEAP);
         let seed = s.enroll(holder("keycard_module", "uid"), Some(&u(1)), "Card", About::default()).unwrap().seed;
         assert!(s.set_rule(&seed, &[], &device(1)).is_err());
-        assert!(s.set_rule(&seed, &[vec![]], &device(1)).is_err());
+        assert!(s.set_rule(&seed, &[vec![], vec![Factor::Device]], &device(1)).is_err());
         assert!(s.set_rule(&seed, &[vec![Factor::Device], vec![Factor::Device]], &device(1)).is_err());
         assert!(s.set_rule(&seed, &[vec![Factor::Password("p_unknown".into())]], &device(1)).is_err());
         assert_eq!(Factor::parse("password:p_ab").unwrap(), Factor::Password("p_ab".into()));
