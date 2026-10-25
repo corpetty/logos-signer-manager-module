@@ -18,6 +18,8 @@ pub trait ManagerProbeModule: Send + 'static {
     fn unlock(&mut self, params_json: String) -> String;
     /// Lock an account, or every one, as the manager's custodian: `lock`'s params.
     fn lock(&mut self, params_json: String) -> String;
+    /// Ask the manager for an identity key of this module's own, as a requester: `request_identity`'s params.
+    fn ask_identity(&mut self, params_json: String) -> String;
     /// Every account with every signer holding it, as a named module reads it.
     fn roster(&mut self) -> String;
     /// The approver chose which holder signs a request on screen.
@@ -91,6 +93,10 @@ impl ManagerProbeModule for ManagerProbeModuleImpl {
 
     fn lock(&mut self, params_json: String) -> String {
         pass(modules().signer_manager_module.lock(&params_json))
+    }
+
+    fn ask_identity(&mut self, params_json: String) -> String {
+        pass(modules().signer_manager_module.request_identity(&params_json))
     }
 
     fn roster(&mut self) -> String {

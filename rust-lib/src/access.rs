@@ -49,6 +49,10 @@ pub trait KeyHolder {
     fn unlock(&mut self, account: &str, password: &str, ttl_ms: Option<u64>, count: Option<u32>) -> Result<Unlocked>;
     fn lock(&mut self, account: Option<&str>) -> Result<usize>;
     fn unlocked(&mut self) -> Result<Vec<Unlocked>>;
+    /// Make (or find again) an identity key for a purpose and a context in an identity group, the
+    /// one named or the only one: `(account id, Ed25519 public key hex)`.
+    fn derive_identity(&mut self, group: Option<&str>, purpose: &str, context: &str, password: &str)
+        -> Result<(String, String)>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -165,6 +169,24 @@ pub struct UnlockParams {
     pub reason: String,
 }
 
+/// `{ purpose, context, unlock?, reason? }`: an identity key the caller asks for. The key the person
+/// approves is derived for `<caller>/<context>`, so a module can only ever obtain its own keys.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IdentityParams {
+    pub purpose: String,
+    pub context: String,
+    #[serde(default)]
+    pub unlock: Option<Terms>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// The context an identity key is derived for: the caller's attested name, then its own context.
+pub fn identity_context(requester: &str, context: &str) -> String {
+    format!("{requester}/{context}")
+}
+
 impl UnlockParams {
     pub fn terms(&self) -> Terms {
         Terms { ttl_ms: self.ttl_ms, count: self.count, apps: self.apps.clone(), confirm: self.confirm }
@@ -175,6 +197,17 @@ impl UnlockParams {
 enum Kind {
     Open(OpenParams),
     Unlock(UnlockParams),
+    Identity(IdentityParams),
+}
+
+impl Kind {
+    fn name(&self) -> &'static str {
+        match self {
+            Kind::Open(_) => "open",
+            Kind::Unlock(_) => "unlock",
+            Kind::Identity(_) => "identity",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +413,43 @@ impl Access {
         Ok(self.push(requester, Kind::Unlock(p), lines))
     }
 
+    /// A module asks for an identity key of its own: for a purpose (`room-identity`, …) and a
+    /// context (a room, a multisig), in an identity group the person picks, optionally unlocked on
+    /// terms. The key is derived for `<caller>/<context>`: the same phrase gives it back after a
+    /// restore, and no other module can ask for it.
+    pub fn request_identity(&mut self, requester: &str, params_json: &str) -> Result<(String, String)> {
+        self.admit(requester)?;
+        let p: IdentityParams = serde_json::from_str(params_json).map_err(|e| bad(format!("identity: {e}")))?;
+        let purpose_ok = !p.purpose.is_empty()
+            && p.purpose.len() <= 64
+            && p.purpose.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.');
+        if !purpose_ok {
+            return Err(bad("identity: purpose is 1-64 of a-z, 0-9, '-' and '.'"));
+        }
+        if p.context.trim().is_empty() || p.context.len() > 400 {
+            return Err(bad("identity: context is 1-400 bytes"));
+        }
+        check_displayable(&p.context, "context")?;
+        check_displayable(&p.reason, "reason")?;
+        if let Some(t) = &p.unlock {
+            t.check()?;
+        }
+        let mut lines = vec![
+            format!("{requester} asks for an identity key of its own"),
+            format!("Purpose: {}", p.purpose),
+            format!("Context: {}", identity_context(requester, &p.context)),
+            "An Ed25519 key from the identity wallet you pick. Only this module can ask for it, and the".into(),
+            "same recovery phrase gives it back after a restore. It will be able to ask you to sign with it.".into(),
+        ];
+        if let Some(t) = &p.unlock {
+            lines.push(format!("It also asks to unlock it: {}", t.describe(requester)));
+        }
+        if !p.reason.trim().is_empty() {
+            lines.push(format!("Reason (claimed by the requester): {}", p.reason.trim()));
+        }
+        Ok(self.push(requester, Kind::Identity(p), lines))
+    }
+
     pub fn queue(&mut self) -> Vec<Summary> {
         self.sweep();
         let now = Instant::now();
@@ -389,10 +459,7 @@ impl Access {
             .map(|r| Summary {
                 handle: r.handle.clone(),
                 requester: r.requester.clone(),
-                kind: match r.kind {
-                    Kind::Open(_) => "open",
-                    Kind::Unlock(_) => "unlock",
-                },
+                kind: r.kind.name(),
                 state: if r.state == State::Rendered { "rendered" } else { "offered" },
                 age_ms: now.duration_since(r.offered_at).as_millis(),
             })
@@ -414,16 +481,15 @@ impl Access {
         Ok(Shown {
             handle: r.handle.clone(),
             requester: r.requester.clone(),
-            kind: match r.kind {
-                Kind::Open(_) => "open",
-                Kind::Unlock(_) => "unlock",
-            },
+            kind: r.kind.name(),
             bundle_id: hex::encode(r.bundle_id),
             lines: r.lines.clone(),
             asked: match &r.kind {
                 Kind::Open(p) => serde_json::json!({ "group": p.group, "family": p.family, "network": p.network,
                                                      "unlock": p.unlock }),
                 Kind::Unlock(p) => serde_json::json!({ "account": p.account, "terms": p.terms() }),
+                Kind::Identity(p) => serde_json::json!({ "purpose": p.purpose, "context": p.context,
+                                                         "unlock": p.unlock }),
             },
         })
     }
@@ -506,6 +572,25 @@ impl Access {
                 let result = serde_json::json!({ "account": found.account.id, "terms": terms,
                                                  "expiresInMs": u.expires_in_ms, "countLeft": u.count_left });
                 (result, Some(scope_for(&found.account.id, &terms, &requester)))
+            }
+            Kind::Identity(p) => {
+                if decision.birthday.is_some() {
+                    return Err(bad("approve_access: an identity key has no birthday"));
+                }
+                let context = identity_context(&requester, &p.context);
+                let (account, public_key) = keys.derive_identity(decision.group.as_deref(), &p.purpose, &context, &password)?;
+                let terms = decision.unlock.or_else(|| p.unlock.clone());
+                let scope = match &terms {
+                    Some(t) => {
+                        t.check()?;
+                        keys.unlock(&account, &password, t.ttl_ms, t.count)?;
+                        Some(scope_for(&account, t, &requester))
+                    }
+                    None => None,
+                };
+                let result = serde_json::json!({ "account": account, "publicKey": public_key,
+                                                 "purpose": p.purpose, "context": context, "unlocked": terms });
+                (result, scope)
             }
         };
         if let Some(s) = scope {
@@ -721,6 +806,12 @@ pub(crate) mod tests {
         fn unlocked(&mut self) -> Result<Vec<Unlocked>> {
             Ok(self.unlocks.clone())
         }
+        fn derive_identity(&mut self, _group: Option<&str>, purpose: &str, context: &str, password: &str)
+            -> Result<(String, String)> {
+            self.database_key("", Some(password))?;
+            let d = Sha256::digest(format!("{purpose}|{context}").as_bytes());
+            Ok((format!("kr_{}", hex::encode(&d[..16])), hex::encode(Sha256::digest(d))))
+        }
     }
 
     fn fixture() -> (Registry, FakeKeys, Access) {
@@ -791,6 +882,58 @@ pub(crate) mod tests {
         // And an unlock is refused before anything is shown.
         let unlock = r#"{"account":"mock-segwit","ttlMs":60000}"#;
         assert!(a.request_unlock(&mut s, "bitcoin_wallet_core_module", unlock).is_err());
+    }
+
+    #[test]
+    fn a_module_asks_for_an_identity_key_and_gets_only_its_own() {
+        let (mut s, mut k, mut a) = fixture();
+        let ask = r#"{"purpose":"room-identity","context":"default","reason":"author room messages"}"#;
+        let (h, r) = a.request_identity("muster_module", ask).unwrap();
+        let shown = a.acknowledge(&h).unwrap();
+        assert_eq!(shown.kind, "identity");
+        let lines = shown.lines.join("\n");
+        assert!(lines.contains("Context: muster_module/default"), "{lines}");
+        assert!(lines.contains("Reason (claimed by the requester): author room messages"), "{lines}");
+        // A wrong password derives nothing and leaves it on screen.
+        assert!(a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "nope", None)).is_err());
+        assert_eq!(a.status(&h, &r).unwrap().0, "rendered");
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).unwrap();
+        let got = a.fetch(&h, &r).unwrap();
+        assert_eq!(got["context"], "muster_module/default");
+        let mine = got["publicKey"].as_str().unwrap().to_string();
+        // Another module naming the same context gets another module's key: its own.
+        let (h2, r2) = a.request_identity("other_module", ask).unwrap();
+        let b2 = a.acknowledge(&h2).unwrap().bundle_id;
+        a.approve(&mut s, &mut k, &h2, &b2, decide(None, "pw", None)).unwrap();
+        let theirs = a.fetch(&h2, &r2).unwrap();
+        assert_eq!(theirs["context"], "other_module/default");
+        assert_ne!(theirs["publicKey"].as_str().unwrap(), mine);
+    }
+
+    #[test]
+    fn an_identity_asked_with_unlock_terms_is_unlocked_for_its_requester_alone() {
+        let (mut s, mut k, mut a) = fixture();
+        let ask = r#"{"purpose":"room-identity","context":"default","unlock":{"count":100,"apps":["muster_module"],"confirm":false}}"#;
+        let (h, r) = a.request_identity("muster_module", ask).unwrap();
+        let shown = a.acknowledge(&h).unwrap();
+        assert!(shown.lines.join("\n").contains("It also asks to unlock it"));
+        a.approve(&mut s, &mut k, &h, &shown.bundle_id, decide(None, "pw", None)).unwrap();
+        let account = a.fetch(&h, &r).unwrap()["account"].as_str().unwrap().to_string();
+        assert_eq!(a.covers(&account, "muster_module"), Cover::WithoutAsking);
+        assert_eq!(a.covers(&account, "other_module"), Cover::No);
+    }
+
+    #[test]
+    fn a_bad_identity_request_is_refused_before_anything_is_shown() {
+        let (_s, _k, mut a) = fixture();
+        for bad in [
+            r#"{"purpose":"Room","context":"default"}"#,
+            r#"{"purpose":"room-identity","context":""}"#,
+            r#"{"purpose":"room-identity","context":"a\u202eb"}"#,
+            r#"{"purpose":"room-identity","context":"x","extra":1}"#,
+        ] {
+            assert!(a.request_identity("muster_module", bad).is_err(), "accepted {bad}");
+        }
     }
 
     #[test]

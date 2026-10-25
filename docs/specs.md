@@ -220,6 +220,16 @@ or the secrets, hex, one per leg. The manager cannot check what the keystore ope
 signature, and the render says so. These legs are a proposal: the signer interface's question of
 where decryption belongs.
 
+**An identity key of an app's own.** A named module asks with `request_identity` (`{ purpose,
+context, unlock?, reason? }`, Tier B), and the person decides in the keys app as for an open:
+`acknowledge_access` shows the purpose, the context, any unlock terms asked and the reason as the
+requester's claim, and `approve_access` (`{ handle, bundle_id, group?, password, unlock? }`) has the
+keystore make the key (`derive_identity`, which answers its manager too). The key is derived for
+`<module>/<context>`, the module's attested name first, so a module only ever obtains keys of its
+own and asking for another module's context gives it a different key. With unlock terms the key is
+unlocked for the requester as an unlock request would. `fetch_result` gives `{ account, publicKey,
+purpose, context, unlocked }`.
+
 The `ed25519` family is on the signer interface's `feat/ed25519-family` branch
 (corpetty/logos-signer-interface `3ebac51`), proposed upstream with the keystore's identity groups.
 

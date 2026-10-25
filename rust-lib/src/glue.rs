@@ -77,6 +77,12 @@ pub trait SignerManagerModule: Send + Sync + 'static {
     /// Ask for an account to stay unlocked: `{ account, ttlMs?, count?, apps?, confirm?, reason? }`
     /// → `{ ok, handle, receipt, state }`. The person decides the terms. Tier B.
     fn request_unlock(&self, params_json: String) -> String;
+    /// Ask for an identity key of the caller's own: `{ purpose, context, unlock?, reason? }` →
+    /// `{ ok, handle, receipt, state }`. The person picks the identity wallet and approves in the
+    /// keys app; the key is derived for `<caller>/<context>`, so a module only ever obtains its own.
+    /// `fetch_result` then returns `{ ok, result: { account, publicKey, purpose, context, unlocked } }`.
+    /// Tier B.
+    fn request_identity(&self, params_json: String) -> String;
     /// The custodian's queue: `{ ok, requests: [{ handle, requester, kind, state, ageMs }] }`. Tier D.
     fn access_requests(&self) -> String;
     /// Claim one for display: `{ ok, handle, requester, kind, bundle_id, lines, asked }`. `asked` is
@@ -291,6 +297,19 @@ impl KeyHolder for KeystoreKeys {
     fn lock(&mut self, account: Option<&str>) -> crate::Result<usize> {
         let v = keystore_reply(modules().keystore_module.lock(&json!({ "account": account }).to_string()))?;
         Ok(v.get("locked").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
+    }
+
+    fn derive_identity(&mut self, group: Option<&str>, purpose: &str, context: &str, password: &str)
+        -> crate::Result<(String, String)> {
+        let body = Zeroizing::new(
+            json!({ "group": group, "purpose": purpose, "context": context, "password": password }).to_string(),
+        );
+        let v = keystore_reply(modules().keystore_module.derive_identity(&body))?;
+        let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        match (field("account"), field("publicKey")) {
+            (Some(a), Some(pk)) => Ok((a, pk)),
+            _ => Err(ManagerError::Signing("keystore derive_identity reply has no account".into())),
+        }
     }
 
     fn unlocked(&mut self) -> crate::Result<Vec<Unlocked>> {
@@ -723,6 +742,19 @@ impl Core {
         }
     }
 
+    fn request_identity(&mut self, params_json: String) -> String {
+        let Some(requester) = self.named_caller() else {
+            return not_authorized();
+        };
+        match self.access.request_identity(&requester, &params_json) {
+            Ok((handle, receipt)) => {
+                emit_access_requested(&handle);
+                json!({ "ok": true, "handle": handle, "receipt": receipt, "state": "offered" }).to_string()
+            }
+            Err(e) => manager_err(&e),
+        }
+    }
+
     fn request_unlock(&mut self, params_json: String) -> String {
         let Some(requester) = self.named_caller() else {
             return not_authorized();
@@ -1063,6 +1095,10 @@ impl SignerManagerModule for SignerManagerModuleImpl {
 
     fn request_unlock(&self, params_json: String) -> String {
         self.core().request_unlock(params_json)
+    }
+
+    fn request_identity(&self, params_json: String) -> String {
+        self.core().request_identity(params_json)
     }
 
     fn access_requests(&self) -> String {

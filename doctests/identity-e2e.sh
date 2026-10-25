@@ -10,7 +10,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
-KEYSTORE="${KEYSTORE:-github:corpetty/logos-evm-keystore-module/b3dc6bc2814f978ae353f4d3b3bc182470487576}"
+KEYSTORE="${KEYSTORE:-github:corpetty/logos-evm-keystore-module/20cfd6f87e38dbc7bdc3ed4e6e72700076eafb40}"
 ABOUT="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 # The reference derivation of m/7432'/0'/c0'…c7' for that phrase, purpose room-identity, context room:a.
 WANT_PK=c8b57cf9c3cc450e042a6ce6f09b0664859d9a1dd916d75e16d76973b10afbba
@@ -150,4 +150,20 @@ SECRET=$(call manager_probe fetch "$H" "$C" | field '["signed"][0]')
 [ "$SECRET" = a8852b6526ea35ddbcc33fff338da70bbb01f94c8854acd7d69c8bf2cf453c54 ] || fail "the founding secret is $SECRET"
 echo "  founding secret matches the reference"
 
-echo "PASS: an identity key from the kept phrase signs, opens and derives through the manager, shown or within an unlock"
+echo "── an app asks for an identity key of its own; the keys app approves it, unlocked for that app"
+r=$(call manager_probe ask_identity '{"purpose":"room-identity","context":"default","unlock":{"count":10,"apps":["manager_probe"],"confirm":false},"reason":"author room messages"}')
+H=$(echo "$r" | field '["handle"]'); C=$(echo "$r" | field '["receipt"]')
+shown=$(call manager_probe show "$H")
+echo "$shown" | grep -qF "Context: manager_probe/default" || fail "the keys app was not shown the namespaced context: $shown"
+call manager_probe decide "{\"handle\":\"$H\",\"bundle_id\":\"$(echo "$shown" | field '["bundle_id"]')\",\"password\":\"pw\"}" | grep -q '"ok":true' || fail "approve the identity request"
+got=$(call manager_probe fetch "$H" "$C")
+echo "  $got"
+APK=$(echo "$got" | field '["result"]["publicKey"]')
+[ "$APK" != "$PK" ] || fail "the app's own key is the custodian's room key"
+R5=$(record 5)
+r=$(call manager_probe request "{\"identity\":\"$APK\",\"legs\":[{\"kind\":\"record\",\"record\":\"$R5\"}]}")
+echo "$r" | grep -q '"state":"settled"' || fail "the app's key did not sign as it asked: $r"
+SIG=$(call manager_probe fetch "$(echo "$r" | field '["handle"]')" "$(echo "$r" | field '["receipt"]')" | field '["signed"][0]')
+verify "$APK" "$R5" "$SIG" || fail "the app's key's signature"
+
+echo "PASS: an identity key from the kept phrase signs, opens and derives through the manager, shown or within an unlock; an app obtains a key of its own"

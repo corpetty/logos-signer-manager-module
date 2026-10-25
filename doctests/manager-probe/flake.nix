@@ -5,7 +5,7 @@
     logos-module-builder.url = "github:logos-co/logos-module-builder";
     keystore_module = {
       # With identity keys (ed25519): corpetty/logos-evm-keystore-module feat/ed25519-identity.
-      url = "github:corpetty/logos-evm-keystore-module/b3dc6bc2814f978ae353f4d3b3bc182470487576";
+      url = "github:corpetty/logos-evm-keystore-module/20cfd6f87e38dbc7bdc3ed4e6e72700076eafb40";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
     signer_manager_module = {
