@@ -810,6 +810,9 @@ impl Core {
             password: String,
             #[serde(default)]
             unlock: Option<Terms>,
+            /// Approve an open or an identity key without the unlock the app asked for.
+            #[serde(default, rename = "noUnlock")]
+            no_unlock: bool,
             /// A device wallet's first day of use, at its first open.
             #[serde(default)]
             birthday: Option<String>,
@@ -819,7 +822,10 @@ impl Core {
             Err(e) => return err(format!("approve_access: {e}")),
         };
         let birthday = w.birthday.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
-        let decision = Decision { group: w.group, password: w.password, unlock: w.unlock, birthday };
+        if w.no_unlock && w.unlock.is_some() {
+            return err("approve_access: noUnlock and unlock terms together".to_string());
+        }
+        let decision = Decision { group: w.group, password: w.password, unlock: w.unlock, no_unlock: w.no_unlock, birthday };
         self.refresh();
         match self.access.approve(&mut self.signers, &mut KeystoreKeys, &w.handle, &w.bundle_id, decision) {
             Ok(()) => {

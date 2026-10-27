@@ -223,11 +223,12 @@ where decryption belongs.
 **An identity key of an app's own.** A named module asks with `request_identity` (`{ purpose,
 context, unlock?, reason? }`, Tier B), and the person decides in the keys app as for an open:
 `acknowledge_access` shows the purpose, the context, any unlock terms asked and the reason as the
-requester's claim, and `approve_access` (`{ handle, bundle_id, group?, password, unlock? }`) has the
+requester's claim, and `approve_access` (`{ handle, bundle_id, group?, password, unlock?, noUnlock? }`) has the
 keystore make the key (`derive_identity`, which answers its manager too). The key is derived for
 `<module>/<context>`, the module's attested name first, so a module only ever obtains keys of its
 own and asking for another module's context gives it a different key. With unlock terms the key is
-unlocked for the requester as an unlock request would. `fetch_result` gives `{ account, publicKey,
+unlocked for the requester as an unlock request would, unless the person approves with
+`noUnlock`: the key, and nothing signed unseen. `fetch_result` gives `{ account, publicKey,
 purpose, context, unlocked }`.
 
 The `ed25519` family is on the signer interface's `feat/ed25519-family` branch
@@ -288,7 +289,9 @@ wallet for it in the keys app, and an account stays unlocked only on terms a per
 - The custodian (the keys app) works the queue with `access_requests`, `acknowledge_access` (the
   lines to show, the commitment to echo, and `asked`: the wallet or the family and network to pick
   from, and the terms the app wants), `approve_access` (`{ handle, bundle_id, group?,
-  password, unlock?, birthday? }`) and `reject_access`. A wrong password answers `code: wrong_secret` and
+  password, unlock?, noUnlock?, birthday? }`) and `reject_access`. Without `unlock`, an open or an
+  identity key is unlocked on the app's own terms; `noUnlock` approves it without them (refused
+  beside `unlock`, and for an unlock request, which is rejected instead). A wrong password answers `code: wrong_secret` and
   leaves the request on screen. The database key comes from the keystore's `database_key`, the
   unlock from its `unlock`; the manager keeps neither.
 - The keys app also unlocks and locks on its own: `unlock` (`{ account, password, ttlMs?,

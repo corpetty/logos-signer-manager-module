@@ -236,6 +236,9 @@ pub struct Decision {
     pub group: Option<String>,
     pub password: String,
     pub unlock: Option<Terms>,
+    /// The person approved without the unlock the app asked for: an open or an identity key, but
+    /// nothing signed unseen. Without it, no `unlock` here means the app's own terms.
+    pub no_unlock: bool,
     /// A device wallet's first day of use, given at its first open.
     pub birthday: Option<String>,
 }
@@ -539,7 +542,7 @@ impl Access {
                 if !on_device && decision.birthday.is_some() {
                     return Err(bad("approve_access: a keystore wallet's birthday was set when it was made"));
                 }
-                let terms = if on_device { None } else { decision.unlock.or_else(|| p.unlock.clone()) };
+                let terms = if on_device || decision.no_unlock { None } else { decision.unlock.or_else(|| p.unlock.clone()) };
                 let opened = if on_device {
                     let (signer, account) = database_holder(signers, keys, &found)?;
                     keys.device_database_key(&signer, &account, &password, decision.birthday.as_deref())?
@@ -565,6 +568,9 @@ impl Access {
                 (result, scope)
             }
             Kind::Unlock(p) => {
+                if decision.no_unlock {
+                    return Err(bad("approve_access: an unlock request approved without its unlock is a rejection: reject it"));
+                }
                 let terms = decision.unlock.unwrap_or_else(|| p.terms());
                 terms.check()?;
                 let found = signers.find(&p.account)?;
@@ -579,7 +585,7 @@ impl Access {
                 }
                 let context = identity_context(&requester, &p.context);
                 let (account, public_key) = keys.derive_identity(decision.group.as_deref(), &p.purpose, &context, &password)?;
-                let terms = decision.unlock.or_else(|| p.unlock.clone());
+                let terms = if decision.no_unlock { None } else { decision.unlock.or_else(|| p.unlock.clone()) };
                 let scope = match &terms {
                     Some(t) => {
                         t.check()?;
@@ -837,7 +843,7 @@ pub(crate) mod tests {
     }
 
     fn decide(group: Option<&str>, password: &str, unlock: Option<Terms>) -> Decision {
-        Decision { group: group.map(str::to_string), password: password.into(), unlock, birthday: None }
+        Decision { group: group.map(str::to_string), password: password.into(), unlock, no_unlock: false, birthday: None }
     }
 
     /// A device's module offering the mock's accounts, and no keystore.
@@ -860,6 +866,7 @@ pub(crate) mod tests {
             group: None,
             password: pw.into(),
             unlock,
+            no_unlock: false,
             birthday: birthday.map(str::to_string),
         };
         let (h, r, b) = open(&mut a, &mut s);
@@ -924,6 +931,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_person_may_give_the_key_and_refuse_the_unlock_it_asked_for() {
+        let (mut s, mut k, mut a) = fixture();
+        let ask = r#"{"purpose":"room-identity","context":"default","unlock":{"count":100,"apps":["muster_module"],"confirm":false}}"#;
+        let (h, r) = a.request_identity("muster_module", ask).unwrap();
+        let b = a.acknowledge(&h).unwrap().bundle_id;
+        let mut d = decide(None, "pw", None);
+        d.no_unlock = true;
+        a.approve(&mut s, &mut k, &h, &b, d).unwrap();
+        let got = a.fetch(&h, &r).unwrap();
+        assert!(got["unlocked"].is_null(), "{got}");
+        let account = got["account"].as_str().unwrap().to_string();
+        assert_eq!(a.covers(&account, "muster_module"), Cover::No);
+        // An unlock request approved without its unlock is not an approval.
+        let unlock = r#"{"account":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","apps":["muster_module"],"confirm":false}"#;
+        let (h2, r2) = a.request_unlock(&mut s, "muster_module", unlock).unwrap();
+        let b2 = a.acknowledge(&h2).unwrap().bundle_id;
+        let mut d2 = decide(None, "pw", None);
+        d2.no_unlock = true;
+        assert!(a.approve(&mut s, &mut k, &h2, &b2, d2).is_err());
+        assert_eq!(a.status(&h2, &r2).unwrap().0, "rendered", "still on screen, to reject");
+    }
+
+    #[test]
     fn a_bad_identity_request_is_refused_before_anything_is_shown() {
         let (_s, _k, mut a) = fixture();
         for bad in [
@@ -958,7 +988,7 @@ pub(crate) mod tests {
         let (mut s, mut k, mut a) = fixture();
         let (h, _) = a.request_open(&mut s, "bitcoin_wallet_core_module", r#"{"group":"mock-segwit","network":"regtest"}"#).unwrap();
         let bundle = a.acknowledge(&h).unwrap().bundle_id;
-        let d = Decision { group: None, password: "pw".into(), unlock: None, birthday: Some("2021-11-14".into()) };
+        let d = Decision { group: None, password: "pw".into(), unlock: None, no_unlock: false, birthday: Some("2021-11-14".into()) };
         assert!(a.approve(&mut s, &mut k, &h, &bundle, d).is_err(), "it was set when the wallet was made");
     }
 
